@@ -1,0 +1,981 @@
+//  Common Includes 
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Adafruit_NeoPixel.h>
+#include <ezButton.h>
+
+//  Wi-Fi / Server 
+const char* ssid = "BridgeControl";
+const char* password = "12345678";
+const uint8_t AP_CHANNEL = 6;
+WebServer server(80);
+
+//  Setup Web Server 
+void setupWebServer() {
+  // WiFi AP
+  WiFi.mode(WIFI_AP);
+  WiFi.setSleep(false);
+  IPAddress ip(10,10,10,1), gw(10,10,10,1), mask(255,255,255,0);
+  WiFi.softAPConfig(ip, gw, mask);
+  bool ok = WiFi.softAP(ssid, password, AP_CHANNEL);
+  Serial.printf("AP: %s, SSID: %s, IP: %s\n", ok ? "ONLINE" : "FAILED", ssid, WiFi.softAPIP().toString().c_str());
+
+  // Routes
+  server.on("/", handleRoot);
+  server.on("/health", handleHealth);
+  server.on("/emergency", handleEmergency);
+  server.on("/reset", handleReset);
+  server.on("/overrideOpen", handleOverrideOpen);
+  server.on("/overrideClose", handleOverrideClose);
+  server.begin();
+  Serial.println("Web server started");
+}
+
+//  Web Log Buffer 
+struct LogBuffer {
+  static constexpr size_t CAP = 200;     // number of lines
+  String lines[CAP];
+  size_t head = 0;                       // next write index
+  bool wrapped = false;
+
+  void add(const String& s) {
+    lines[head] = s;
+    head = (head + 1) % CAP;
+    if (head == 0) wrapped = true;
+  }
+
+  String dumpHTML() const {
+    String out;
+    out.reserve(8192);
+    out += F("<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Logs</title><style>body{font-family:ui-monospace,Menlo,Consolas,monospace;background:#0b0d10;color:#e3e7ee;margin:0}h1{margin:0;padding:12px 16px;background:#171a1f}pre{white-space:pre-wrap;word-wrap:break-word;margin:0;padding:16px}a{color:#9ecbff;text-decoration:none;margin:0 16px}</style></head><body>");
+    out += F("<h1>Bridge Logs</h1><div style='padding:8px'><a href='/'>&larr; Back</a><a href='/logs?clear=1' style='float:right'>Clear</a></div><pre>");
+
+    if (wrapped) {
+      for (size_t i = head; i < CAP; ++i) { if (lines[i].length()) { out += lines[i]; out += '\n'; } }
+    }
+    for (size_t i = 0; i < (wrapped ? head : head); ++i) { if (lines[i].length()) { out += lines[i]; out += '\n'; } }
+
+    out += F("</pre></body></html>");
+    return out;
+  }
+
+  void clear() { head = 0; wrapped = false; for (size_t i=0;i<CAP;++i) lines[i] = String(); }
+} gLog;
+
+// A small shim that looks like Serial for print/println mirroring
+class SerialMuxClass {
+public:
+  void begin(unsigned long baud) { Serial.begin(baud); }
+
+  // print overloads (common ones used by the provided code)
+  void print(const String& s)       { Serial.print(s);       gLog.add(s); }
+  void print(const char* s)         { Serial.print(s);       gLog.add(String(s)); }
+  void print(char c)                { Serial.print(c);       gLog.add(String(c)); }
+  void print(int v)                 { Serial.print(v);       gLog.add(String(v)); }
+  void print(unsigned v)            { Serial.print(v);       gLog.add(String(v)); }
+  void print(long v)                { Serial.print(v);       gLog.add(String(v)); }
+  void print(unsigned long v)       { Serial.print(v);       gLog.add(String(v)); }
+  void print(float v)               { Serial.print(v);       gLog.add(String(v)); }
+  void print(double v)              { Serial.print(v);       gLog.add(String(v)); }
+
+  void println()                    { Serial.println();      gLog.add(String()); }
+  void println(const String& s)     { Serial.println(s);     gLog.add(s); }
+  void println(const char* s)       { Serial.println(s);     gLog.add(String(s)); }
+  void println(char c)              { Serial.println(c);     gLog.add(String(c)); }
+  void println(int v)               { Serial.println(v);     gLog.add(String(v)); }
+  void println(unsigned v)          { Serial.println(v);     gLog.add(String(v)); }
+  void println(long v)              { Serial.println(v);     gLog.add(String(v)); }
+  void println(unsigned long v)     { Serial.println(v);     gLog.add(String(v)); }
+  void println(float v)             { Serial.println(v);     gLog.add(String(v)); }
+  void println(double v)            { Serial.println(v);     gLog.add(String(v)); }
+};
+
+static SerialMuxClass SerialMux;
+#define Serial SerialMux  // <-- transparently mirror prints to web logs
+
+//  BEGIN: WorkingLogic (verbatim, wrapped) 
+//  NeoPixel 
+#define DATA_PIN1 14     // Cars strip
+#define DATA_PIN2 12     // Boats strip
+#define NUM_LEDS_PER_STRIP 30
+
+Adafruit_NeoPixel strip1(NUM_LEDS_PER_STRIP, DATA_PIN1, NEO_GRB + NEO_KHZ800); // Boats
+Adafruit_NeoPixel strip2(NUM_LEDS_PER_STRIP, DATA_PIN2, NEO_GRB + NEO_KHZ800); // Cars
+
+//  Motor  
+#define CARPIXELS      12   
+#define BOATPIXELS     12
+
+#define EN1          33     
+#define IN1          32     
+#define IN2          27   
+
+// Ultrasonic TRIG/ECHO (Left = FAR sensor, Right = CLOSE sensor)
+#define LEFT_TRIG    17     // FAR TRIG
+#define LEFT_ECHO    16     // FAR ECHO
+#define RIGHT_TRIG   18     // CLOSE TRIG
+#define RIGHT_ECHO    5     // CLOSE ECHO
+
+// Buttons 
+#define BUTTON1       9
+#define BUTTON2      10
+
+// Distance threshold (cm)
+#define THRESHOLD_CM  35   // trigger up to 5 meters
+
+// Optional: minimum detection distance to ignore ultra-close noise
+//#define DETECT_MIN_CM 30
+
+// Override Buttons
+#define OVERRIDE_OPEN_PIN   19
+#define OVERRIDE_CLOSE_PIN  21
+
+// Bridge state
+bool bridgeOpen = false;
+bool motorDirection = false;          // false = last open used backward(), true = last open used forward()
+unsigned long bridgeOpenTime = 0;
+#define MIN_OPEN_TIME 150
+
+// Emergency Button Pin
+#define EMERGENCY_PIN 26
+volatile bool emergencyActive = false;
+
+// ---- NEW: unified preemption for web commands ----
+volatile bool webOverrideOpenRequest  = false;  // OverideOpen Flag
+volatile bool webOverrideCloseRequest = false;  // OverideClose Flag
+volatile bool bridgeOpenRequest       = false;  // Open bridge flag (manual pins)
+volatile bool bridgeCloseRequest      = false;  // Close bridge flag (manual pins)
+volatile bool webPreemptRequested     = false;
+volatile bool emergencyPending        = false;  // <-- NEW: set by web handlers to interrupt waits/motion
+
+unsigned long lastFlashTime = 0;
+bool flashState = false;
+unsigned long lastSirenTime = 0;
+int sirenFreq = 800;
+bool sirenDirection = true;
+
+void IRAM_ATTR emergencyISR() {
+  emergencyPending = true;
+  webPreemptRequested = true;
+}
+
+// Forward decls
+long readDistanceCM(int trigPin, int echoPin);
+void setAll(Adafruit_NeoPixel &strip, uint32_t color);
+void forward(int speed);
+void backward(int speed);
+void stopMotor();
+void enterEmergency();
+// Debounced limit read
+bool limitPressed(int pin, unsigned long stableMs = 25);
+
+// ---- UPDATED: Emergency/web-aware wait helper ----
+inline bool waitWithEmergency(unsigned long ms){
+  unsigned long t0 = millis();
+  while (millis() - t0 < ms){
+    server.handleClient();
+    if (emergencyActive || webPreemptRequested || emergencyPending) return false;  // <-- NEW: preempt
+    delay(5);
+  }
+  return true;
+}
+
+// Amber for cars
+uint32_t amber(Adafruit_NeoPixel &s) { return s.Color(255, 100, 0); }
+
+// Limit Switch Pins
+const int limitSwitchOpen  = 22;  // was limitSwitch1 (OPEN limit)
+const int limitSwitchClose = 23;  // was limitSwitch2 (CLOSE limit)
+
+// Buzzer
+const int buzzerPin = 25;
+
+void logicSetup() {
+  Serial.begin(115200);
+  delay(200);
+
+  // NeoPixels
+  strip1.begin();
+  strip2.begin();
+  strip1.show(); 
+  strip2.show();
+
+  // Motor pins
+  pinMode(EN1, OUTPUT);
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  stopMotor();
+
+  // Ultrasonic pins
+  pinMode(LEFT_TRIG, OUTPUT);
+  pinMode(LEFT_ECHO, INPUT);
+  pinMode(RIGHT_TRIG, OUTPUT);
+  pinMode(RIGHT_ECHO, INPUT);
+
+  // Initial state
+  setAll(strip2, strip2.Color(0, 255, 0)); // Cars green
+  setAll(strip1, strip1.Color(255, 0, 0)); // Boats red
+  strip1.show();
+  strip2.show();
+  
+  // Limit Switches (INPUT_PULLUP -> pressed == LOW)
+  pinMode(limitSwitchOpen,  INPUT_PULLUP);
+  pinMode(limitSwitchClose, INPUT_PULLUP);
+
+  // Emergency button
+  pinMode(EMERGENCY_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(EMERGENCY_PIN), emergencyISR, FALLING);
+
+  // Override buttons up and down
+  pinMode(OVERRIDE_OPEN_PIN, INPUT_PULLUP);
+  pinMode(OVERRIDE_CLOSE_PIN, INPUT_PULLUP);
+
+  // Buzzer
+  pinMode(buzzerPin, OUTPUT);
+}
+
+void logicLoop() {
+  if (emergencyPending) { 
+    emergencyPending = false; 
+    enterEmergency();
+    return;
+    }
+
+  // ---- Immediate service of WEB overrides (pre-clears preempt so we can run) ----
+  if (webOverrideOpenRequest) {
+    webOverrideOpenRequest = false;
+    webPreemptRequested = false;          // <-- consume preempt
+    Serial.println("Web Override: OPEN bridge");
+    emergencyActive = false;
+    stopMotor();
+    setAll(strip2, strip2.Color(255,0,0)); strip2.show();
+    setAll(strip1, strip1.Color(255,0,0)); strip1.show();
+    if (!waitWithEmergency(20)) return;
+
+    bool hitOpen = driveUntilLimit(backward, 255, limitSwitchOpen, 15000);
+    if (!hitOpen) Serial.println("WARNING: Open limit not reached.");
+
+    setAll(strip1, strip1.Color(0,255,0)); strip1.show();
+    setAll(strip2, strip2.Color(255,0,0)); strip2.show();
+    bridgeOpen = true;
+    motorDirection = false;
+    bridgeOpenTime = millis();
+  }
+
+  if (webOverrideCloseRequest) {
+    webOverrideCloseRequest = false;
+    webPreemptRequested = false;          // <-- consume preempt
+    Serial.println("Web Override: CLOSE bridge");
+    emergencyActive = false;
+    stopMotor();
+    setAll(strip1, strip1.Color(255,0,0)); strip1.show();
+    delay(300);
+
+    // ===== CHANGED: choose direction based on motorDirection =====
+    bool hitClose = false;
+    if (motorDirection == false) {
+      // last open was backward -> close forward
+      hitClose = driveUntilLimit(forward, 255, limitSwitchClose, 15000);
+    } else {
+      // last open was forward -> close backward
+      hitClose = driveUntilLimit(backward, 255, limitSwitchClose, 15000);
+    }
+    // ===== END CHANGE =====
+
+    if (!hitClose) Serial.println("WARNING: Close limit not reached.");
+
+    setAll(strip2, strip2.Color(0,255,0)); strip2.show();
+    setAll(strip1, strip1.Color(255,0,0)); strip1.show();
+    bridgeOpen = false;
+  }
+
+  // Emergency handling first
+  if (emergencyActive) {
+    stopMotor();
+
+    // Siren effect
+    if (millis() - lastSirenTime >= 10) {
+      lastSirenTime = millis();
+      if (sirenDirection) {
+        sirenFreq += 20;
+        if (sirenFreq >= 1200) sirenDirection = false;
+      } else {
+        sirenFreq -= 20;
+        if (sirenFreq <= 800) sirenDirection = true;
+      }
+      tone(buzzerPin, sirenFreq);
+    }
+    
+    // Flash all lights red 
+    if (millis() - lastFlashTime >= 500) {
+      flashState = !flashState;
+      lastFlashTime = millis();
+      if (flashState) {
+        setAll(strip2, strip2.Color(255, 0, 0)); strip2.show();
+        setAll(strip1, strip1.Color(255, 0, 0)); strip1.show(); 
+      } else {
+        setAll(strip1, strip1.Color(0, 0, 0));
+        setAll(strip2, strip2.Color(0, 0, 0));
+      }
+      strip1.show();
+      strip2.show();
+    }
+    Serial.println("EMERGENCY STOP ACTIVE");
+    delay(100); 
+
+    //  EMERGENCY OVERRIDES (leave emergency into OPEN/CLOSED) 
+
+    //  Emergency -> OPEN 
+    if (digitalRead(OVERRIDE_OPEN_PIN) == LOW) {
+      Serial.println("Manual Override (EMERGENCY): OPEN bridge");
+      stopMotor();
+      noTone(buzzerPin);                 // stop siren
+      // Briefly hold both red during transition
+      setAll(strip2, strip2.Color(255, 0, 0)); strip2.show();  // Cars red
+      setAll(strip1, strip1.Color(255, 0, 0)); strip1.show();  // Boats red
+      delay(300);
+
+      // Allow motion by clearing emergency before driving
+      emergencyActive = false;
+
+      // Open bridge; original used backward()
+      bool hitOpen = driveUntilLimit(backward, 255, limitSwitchOpen, 15000);
+      if (!hitOpen) Serial.println("WARNING: Open limit not reached.");
+
+      // Enter normal OPEN state
+      setAll(strip1, strip1.Color(0, 255, 0)); strip1.show();  // Boats green
+      setAll(strip2, strip2.Color(255, 0, 0)); strip2.show();  // Cars red
+      bridgeOpen      = true;
+      motorDirection  = false;  // last open used backward()
+      bridgeOpenTime  = millis();
+
+      // Debounce button release
+      while (digitalRead(OVERRIDE_OPEN_PIN) == LOW) delay(10);
+      return; // skip rest of loop this cycle
+    }
+
+    //  Emergency -> CLOSE 
+    if (digitalRead(OVERRIDE_CLOSE_PIN) == LOW) {
+      Serial.println("Manual Override (EMERGENCY): CLOSE bridge");
+      stopMotor();
+      noTone(buzzerPin);                 // stop siren
+      setAll(strip1, strip1.Color(255, 0, 0)); strip1.show();  // Boats red
+      delay(300);
+
+      // Allow motion by clearing emergency before driving
+      emergencyActive = false;
+
+      // Close bridge (original emergency close used forward)
+      bool hitClose = driveUntilLimit(forward, 255, limitSwitchClose, 15000);
+      if (!hitClose) Serial.println("WARNING: Close limit not reached.");
+
+      // Enter normal CLOSED state
+      setAll(strip2, strip2.Color(0, 255, 0)); strip2.show();  // Cars green
+      setAll(strip1, strip1.Color(255, 0, 0)); strip1.show();  // Boats red
+      bridgeOpen = false;
+
+      while (digitalRead(OVERRIDE_CLOSE_PIN) == LOW) delay(10);
+      return; // skip rest of loop this cycle
+    }
+
+    // No override pressed: stay in emergency behavior
+    return; 
+  } else {
+    noTone(buzzerPin); // Turn off siren when not in emergency
+  }
+
+  // Read sensors with crosstalk guard
+  long farcm   = readDistanceCM(LEFT_TRIG, LEFT_ECHO);    // FAR sensor
+  delay(50); // allow echoes to dissipate before next ping
+  long closecm = readDistanceCM(RIGHT_TRIG, RIGHT_ECHO);  // CLOSE sensor
+
+  Serial.print("Far sensor: ");
+  Serial.print(farcm);
+  Serial.print("cm, Close sensor: ");
+  Serial.print(closecm);
+  Serial.print("cm, Bridge: ");
+  Serial.println(bridgeOpen ? "OPEN" : "CLOSED");
+
+  //  OPENING SEQUENCE (sensor facing me / FAR triggers) 
+  if (farcm > 0 && farcm <= THRESHOLD_CM && !bridgeOpen) {
+    Serial.println("Sensor Triggered (FAR) - Opening, Cars stopping.");
+
+    // Traffic lights sequencing
+    setAll(strip2, strip2.Color(255, 165, 0)); strip2.show(); // cars = orange
+    if (!waitWithEmergency(4000)) return;
+    setAll(strip2, strip2.Color(255, 0, 0)); strip2.show();   // cars = red
+    if (!waitWithEmergency(4000)) return;
+    setAll(strip1, strip1.Color(255, 0, 0)); strip1.show();   // boats = red
+    if (!waitWithEmergency(4000)) return;
+
+    // Open bridge: original code used backward() here
+    bool hitOpen = driveUntilLimit(backward, 255, limitSwitchOpen, 15000);
+    if (!hitOpen) {
+      Serial.println("WARNING: Open limit not reached (timeout or emergency).");
+    }
+
+    // Boats green
+    if (!waitWithEmergency(2500)) return;
+    setAll(strip1, strip1.Color(0, 255, 0)); strip1.show();
+    Serial.println("Bridge State: Open. Traffic: Boats passing.");
+
+    bridgeOpen = true;
+    motorDirection = false; // last open used backward()
+    bridgeOpenTime = millis();
+  }
+
+  //  OPENING SEQUENCE (sensor facing away / CLOSE triggers) 
+  if (closecm > 0 && closecm <= THRESHOLD_CM && !bridgeOpen) {
+    Serial.println("Sensor Triggered (CLOSE) - Opening, Cars stopping.");
+
+    // Traffic lights sequencing
+    setAll(strip2, strip2.Color(255, 165, 0)); strip2.show(); // cars = orange
+    if (!waitWithEmergency(4000)) return;
+    setAll(strip2, strip2.Color(255, 0, 0)); strip2.show();   // cars = red
+    if (!waitWithEmergency(4000)) return;
+    setAll(strip1, strip1.Color(255, 0, 0)); strip1.show();   // boats = red
+    if (!waitWithEmergency(4000)) return;
+
+    // Open bridge: original code used forward() here
+    bool hitOpen2 = driveUntilLimit(forward, 255, limitSwitchOpen, 15000);
+    if (!hitOpen2) {
+      Serial.println("WARNING: Open limit not reached (timeout or emergency).");
+    }
+
+    // Boats green
+    if (!waitWithEmergency(2500)) return;
+    setAll(strip1, strip1.Color(0, 255, 0)); strip1.show();
+    Serial.println("Bridge State: Open. Traffic: Boats passing.");
+
+    bridgeOpen = true;
+    motorDirection = true; // last open used forward()
+    bridgeOpenTime = millis();
+  }
+
+  //  CLOSING SEQUENCE 
+  // Bridge is open AND no boat detected by either sensor AND minimum open time passed
+  if (bridgeOpen && (farcm > THRESHOLD_CM || farcm <= 0) && (closecm > THRESHOLD_CM || closecm <= 0)) {
+    if (millis() - bridgeOpenTime >= MIN_OPEN_TIME) {
+      Serial.println("No boat detected, closing sequence starting");
+
+      // Boats to red 
+      if (!waitWithEmergency(5000)) return;
+      setAll(strip1, strip1.Color(255, 0, 0)); strip1.show(); 
+      Serial.println("Boats: RED");
+      if (!waitWithEmergency(5000)) return;
+
+      Serial.println("Closing bridge");
+      bool hitClose = false;
+      if (motorDirection == false) {
+        // last open was backward -> now close forward
+        hitClose = driveUntilLimit(forward, 255, limitSwitchClose, 15000);
+      } else {
+        // last open was forward -> now close backward
+        hitClose = driveUntilLimit(backward, 255, limitSwitchClose, 15000);
+      }
+      if (!hitClose) {
+        Serial.println("WARNING: Close limit not reached (timeout or emergency).");
+      }
+
+      Serial.println("Bridge State: Closed. Traffic: Cars resuming.");
+      
+      // Cars back to green, boats stay red
+      if (!waitWithEmergency(5000)) return;
+      setAll(strip2, strip2.Color(0, 255, 0)); strip2.show(); // cars = green
+      setAll(strip1, strip1.Color(255, 0, 0)); strip1.show(); // boats = red
+      if (!waitWithEmergency(5000)) return;
+      
+      // Bridge is now closed
+      bridgeOpen = false;
+      Serial.println("Bridge fully closed");
+    }
+  }
+
+  // Keep bridge open if a boat is still detected
+  if (bridgeOpen && ((farcm > 0 && farcm <= THRESHOLD_CM) || (closecm > 0 && closecm <= THRESHOLD_CM))) {
+    setAll(strip1, strip1.Color(0, 255, 0)); strip1.show(); // boats green
+    setAll(strip2, strip2.Color(255, 0, 0)); strip2.show(); // cars red
+    Serial.println("Boat still detected");
+    bridgeOpenTime = millis();
+  }
+
+  if (!waitWithEmergency(500)) return;
+}
+
+//  Helpers 
+long readDistanceCM(int trigPin, int echoPin) {
+  // Ensure ECHO is low before starting a new measurement
+  unsigned long guardStart = millis();
+  while (digitalRead(echoPin) == HIGH && millis() - guardStart < 5) {
+    delayMicroseconds(50);
+  }
+
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(5);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  // Increased timeout for up to (and beyond) 5 m
+  long duration = pulseIn(echoPin, HIGH, 60000UL); // 60ms ≈ ~10m headroom
+  if (duration == 0) return -1; // no reading
+  long cm = duration / 29 / 2;
+  return cm;
+}
+
+// Fill entire strip with a color
+void setAll(Adafruit_NeoPixel &strip, uint32_t color) {
+  for (int i = 0; i < strip.numPixels(); i++) {
+    strip.setPixelColor(i, color);
+  }
+}
+
+// Motor control
+void forward(int speed) {
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  analogWrite(EN1, speed);  
+}
+
+void backward(int speed) {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  analogWrite(EN1, speed);
+}
+
+void stopMotor() {
+  // Coast stop
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  analogWrite(EN1, 0);
+}
+
+void enterEmergency() {
+  emergencyActive = true;
+  stopMotor();
+  webPreemptRequested = true;
+
+  sirenFreq = 800;
+  sirenDirection = true;
+  setAll(strip1, strip1.Color(255, 0, 0));  // Boats red
+  setAll(strip2, strip2.Color(255, 0, 0));  // Cars red
+  strip1.show();
+  strip2.show();
+}
+
+
+// Debounced read for INPUT_PULLUP limit switch (pressed == LOW)
+bool limitPressed(int pin, unsigned long stableMs) {
+  if (digitalRead(pin) == LOW) {
+    unsigned long t0 = millis();
+    while (millis() - t0 < stableMs) {
+      if (digitalRead(pin) != LOW) return false;
+      delay(1);
+    }
+    return true;
+  }
+  return false;
+}
+
+// ---- UPDATED: Drive until limit pressed / emergency / preempt / timeout ----
+bool driveUntilLimit(void (*driveFn)(int), int speed, int limitPin, unsigned long timeoutMs) {
+  unsigned long t0 = millis();
+  driveFn(speed);  // start moving
+
+  while (millis() - t0 < timeoutMs) {
+    // Service web requests so override buttons are responsive during motion
+    server.handleClient();
+    if (emergencyActive || webPreemptRequested || emergencyPending) {     // <-- NEW: preempt
+      stopMotor();
+      Serial.println("Preempted (emergency/web) -> motor stopped");
+      return false;
+    }
+    if (limitPressed(limitPin, 25)) { // pressed & stable
+      stopMotor();
+      Serial.println("Limit reached -> motor stopped");
+      return true;
+    }
+    delay(5); // small yield
+  }
+
+  stopMotor(); // safety
+  Serial.println("Timeout waiting for limit -> motor stopped");
+  return false;
+}
+
+//  END: WorkingLogic 
+
+//  WEB UI HELPER FUNCTIONS 
+bool colorEquals(uint32_t c1, uint32_t c2) {
+  return ((c1 & 0xFFFFFF) == (c2 & 0xFFFFFF));
+}
+
+String bridgeStateString() {
+  if (emergencyActive) return "EMERGENCY";
+  return bridgeOpen ? "Open" : "Closed";
+}
+
+String getTrafficState() {
+  if (emergencyActive) return "EMERGENCY STOP";
+  if (bridgeOpen) return "Boats Passing - Bridge Open";
+  return "Cars Passing - Bridge Closed";
+}
+
+//  HTML UI 
+String htmlPage(long farcm, long closecm) {
+  // Build header + styles
+  String page = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  page += "<meta http-equiv='refresh' content='2'><title>Bridge Control System</title><style>";
+  page += "*{margin:0;padding:0;box-sizing:border-box}body{font-family:Segoe UI,Tahoma,Geneva,Verdana,sans-serif;background:linear-gradient(135deg,#667eea,#764ba2);color:#333;min-height:100vh}";
+  page += ".header{background:rgba(0,0,0,.8);color:#fff;padding:20px 0;text-align:center;box-shadow:0 2px 10px rgba(0,0,0,.3)}";
+  page += ".container{max-width:1400px;margin:0 auto;padding:30px 20px;display:grid;grid-template-columns:1fr 1fr 1fr;gap:25px}";
+  page += "@media(max-width:1024px){.container{grid-template-columns:1fr 1fr}}@media(max-width:768px){.container{grid-template-columns:1fr}}";
+  page += ".card{background:rgba(255,255,255,.95);border-radius:12px;padding:25px;box-shadow:0 8px 32px rgba(0,0,0,.1);border:1px solid rgba(255,255,255,.2)}";
+  page += ".card h2{color:#2c3e50;margin-bottom:20px;font-size:1.2rem;border-bottom:2px solid #3498db;padding-bottom:10px}";
+  page += ".status-grid{display:grid;grid-template-columns:1fr 1fr;gap:15px}.status-item{background:#f8f9fa;padding:15px;border-radius:8px;border-left:4px solid #3498db}";
+  page += ".status-label{font-size:.9rem;color:#666;text-transform:uppercase;letter-spacing:1px}.status-value{font-size:1.2rem;font-weight:700;color:#2c3e50;margin-top:5px}";
+  page += ".sensor-reading{display:flex;justify-content:space-between;align-items:center;padding:12px 0;border-bottom:1px solid #ecf0f1}.sensor-reading:last-child{border-bottom:none}";
+  page += ".sensor-label{font-weight:600;color:#34495e}.sensor-value{font-family:'Courier New',monospace;font-size:1.05rem;padding:4px 8px;border-radius:4px}";
+  page += ".sensor-normal{background:#d5f4e6;color:#27ae60}.sensor-detected{background:#fadbd8;color:#e74c3c;font-weight:700;animation:pulse 1s infinite}";
+  page += ".traffic-container{display:flex;justify-content:space-around;margin-top:20px}.traffic-light{width:100px;height:280px;background:linear-gradient(180deg,#2c3e50,#34495e);border-radius:25px;padding:20px 0;display:flex;flex-direction:column;justify-content:space-around;align-items:center;box-shadow:0 4px 15px rgba(0,0,0,.3)}";
+  page += ".light{width:60px;height:60px;border-radius:50%;border:3px solid #7f8c8d;background:#34495e;transition:all .3s ease}.light.red{background:radial-gradient(circle at 30% 30%,#ff6b6b,#e74c3c);box-shadow:0 0 20px rgba(231,76,60,.6)}";
+  page += ".light.yellow{background:radial-gradient(circle at 30% 30%,#feca57,#f39c12);box-shadow:0 0 20px rgba(243,156,18,.6)}.light.green{background:radial-gradient(circle at 30% 30%,#48dbfb,#27ae60);box-shadow:0 0 20px rgba(39,174,96,.6)}";
+  page += ".traffic-label{color:#000;font-weight:700;margin-top:15px;text-align:center;font-size:1rem}";
+  page += ".control-buttons{display:grid;grid-template-columns:1fr;gap:15px;margin-top:20px}";
+  page += ".btn{padding:15px 20px;border:none;border-radius:8px;font-size:1rem;font-weight:600;cursor:pointer;transition:all .3s ease;text-decoration:none;display:inline-block;text-align:center}";
+  page += ".btn:hover{transform:translateY(-2px);box-shadow:0 4px 15px rgba(0,0,0,.2)}";
+  page += ".btn-danger{background:linear-gradient(135deg,#e74c3c,#c0392b);color:#fff}";
+  page += ".btn-secondary{background:linear-gradient(135deg,#95a5a6,#7f8c8d);color:#fff}";
+  page += "@keyframes pulse{0%,100%{opacity:1}50%{opacity:.7}}@keyframes flashRed{0%,100%{background:#34495e}50%{background:radial-gradient(circle at 30% 30%,#ff6b6b,#e74c3c)}}.emergency-flash{animation:flashRed 1s infinite}";
+  page += "</style></head><body>";
+
+  // Header + container open
+  page += "<div class='header'><h1>Bridge Control System</h1></div>";
+  page += "<div class='container'>";
+
+  // System Status
+  page += "<div class='card'><h2>System Status</h2><div class='status-grid'>";
+  page += "<div class='status-item'><div class='status-label'>Bridge State</div><div class='status-value'>" + bridgeStateString() + "</div></div>";
+  page += "<div class='status-item'><div class='status-label'>Traffic State</div><div class='status-value'>" + getTrafficState() + "</div></div>";
+  page += "</div></div>";
+
+  // Sensors
+  bool boatLeft = (farcm > 0 && farcm <= THRESHOLD_CM);
+  bool boatRight = (closecm > 0 && closecm <= THRESHOLD_CM);
+
+  page += "<div class='card'><h2>Sensor Readings</h2>";
+  page += "<div class='sensor-reading'><span class='sensor-label'>Left Sensor (Far):</span>";
+  page += "<span class='sensor-value " + String(boatLeft ? "sensor-detected" : "sensor-normal") + "'>" + String(farcm) + " cm</span></div>";
+  page += "<div class='sensor-reading'><span class='sensor-label'>Right Sensor (Close):</span>";
+  page += "<span class='sensor-value " + String(boatRight ? "sensor-detected" : "sensor-normal") + "'>" + String(closecm) + " cm</span></div>";
+  page += "<div class='sensor-reading'><span class='sensor-label'>Boat Status:</span>";
+  if (boatLeft && boatRight)      page += "<span class='sensor-value sensor-detected'>CROSSING (Left & Right)</span>";
+  else if (boatRight)             page += "<span class='sensor-value sensor-detected'>AT BRIDGE (Right)</span>";
+  else if (boatLeft)              page += "<span class='sensor-value sensor-detected'>APPROACHING (Left)</span>";
+  else                            page += "<span class='sensor-value sensor-normal'>CLEAR</span>";
+  page += "</div></div>";
+
+  // Read pixel colors (safe single calls)
+  uint32_t carColor = strip2.getPixelColor(0);
+  uint32_t boatColor = strip1.getPixelColor(0);
+
+  // Traffic lights - Cars
+  page += "<div class='card'><h2>Traffic Control</h2><div class='traffic-container'>";
+  page += "<div><div class='traffic-light'>";
+  if (emergencyActive) {
+    page += "<div class='light emergency-flash'></div><div class='light emergency-flash'></div><div class='light emergency-flash'></div>";
+  } else {
+    bool carRed = colorEquals(carColor, strip2.Color(255, 0, 0));
+    bool carYellow = colorEquals(carColor, strip2.Color(255, 165, 0));
+    bool carGreen = colorEquals(carColor, strip2.Color(0, 255, 0));
+
+    page += "<div class='light " + String(carRed ? "red" : "") + "'></div>";
+    page += "<div class='light " + String(carYellow ? "yellow" : "") + "'></div>";
+    page += "<div class='light " + String(carGreen ? "green" : "") + "'></div>";
+  }
+  page += "</div><div class='traffic-label'>Cars</div></div>";
+
+  // Traffic lights - Boats
+  page += "<div><div class='traffic-light'>";
+  if (emergencyActive) {
+    page += "<div class='light emergency-flash'></div><div class='light emergency-flash'></div><div class='light emergency-flash'></div>";
+  } else {
+    bool boatRed = colorEquals(boatColor, strip1.Color(255, 0, 0));
+    bool boatGreen = colorEquals(boatColor, strip1.Color(0, 255, 0));
+
+    page += "<div class='light " + String(boatRed ? "red" : "") + "'></div>";
+    page += "<div class='light'></div>";
+    page += "<div class='light " + String(boatGreen ? "green" : "") + "'></div>";
+  }
+  page += "</div><div class='traffic-label'>Boats</div></div>";
+  page += "</div></div>";
+
+  // Manual controls (buttons link to handlers)
+  page += "<div class='card'><h2>Manual Controls</h2>";
+  page += "<div class='control-buttons' style='margin-top:10px;'>";
+  page += "<a href='/emergency' class='btn btn-danger'>Activate Emergency</a>";
+  page += "<a href='/reset' class='btn btn-secondary'>Reset System</a>";
+  page += "<a href='/overrideOpen' class='btn btn-secondary'>Override Open</a>";
+  page += "<a href='/overrideClose' class='btn btn-secondary'>Override Close</a>";
+  page += "</div></div>";
+
+  page += "</div></body></html>";
+  return page;
+}
+
+void handleRoot() {
+  long farcm   = readDistanceCM(LEFT_TRIG, LEFT_ECHO);
+  delay(50); // avoid crosstalk before reading the second sensor for UI
+  long closecm = readDistanceCM(RIGHT_TRIG, RIGHT_ECHO);
+  server.send(200, "text/html", htmlPage(farcm, closecm));
+}
+
+void handleHealth() {
+  server.send(200, "text/plain", "OK");
+}
+
+void handleEmergency() {
+  emergencyActive = true;
+  enterEmergency();
+  server.sendHeader("Location", "/");
+  server.send(302, "text/plain", "");
+}
+
+// ====== UPDATED WEB HANDLERS (only act during EMERGENCY; exit it and perform sequence) ======
+void handleReset() {
+  // Only allow reset while in EMERGENCY
+  if (!emergencyActive) {
+    Serial.println("Reset ignored (not in EMERGENCY).");
+    server.sendHeader("Location", "/");
+    server.send(302, "text/plain", "");
+    return;
+  }
+
+  Serial.println("RESET: Restoring default state from EMERGENCY.");
+  emergencyActive = false;       // exit emergency
+  noTone(buzzerPin);
+  stopMotor();
+
+  // Default state: bridge CLOSED, Cars GREEN, Boats RED
+  bridgeOpen = false;
+  setAll(strip1, strip1.Color(255, 0, 0)); // boats red
+  setAll(strip2, strip2.Color(0, 255, 0)); // cars green
+  strip1.show();
+  strip2.show();
+
+  webPreemptRequested = true;    // break out of any waits/motion immediately
+  server.sendHeader("Location", "/");
+  server.send(302, "text/plain", "");
+}
+
+void handleOverrideOpen() {
+  // Only allow UI override when in EMERGENCY
+  if (!emergencyActive) {
+    Serial.println("OverrideOpen ignored (not in EMERGENCY).");
+    server.sendHeader("Location", "/");
+    server.send(302, "text/plain", "");
+    return;
+  }
+  Serial.println("OverrideOpen requested (EMERGENCY).");
+  webOverrideOpenRequest = true;   // handled immediately inside emergency block now
+  webPreemptRequested    = true;   // preempt current waits/motion
+  server.sendHeader("Location", "/");
+  server.send(302, "text/plain", "");
+}
+
+void handleOverrideClose() {
+  // Only allow UI override when in EMERGENCY
+  if (!emergencyActive) {
+    Serial.println("OverrideClose ignored (not in EMERGENCY).");
+    server.sendHeader("Location", "/");
+    server.send(302, "text/plain", "");
+    return;
+  }
+  Serial.println("OverrideClose requested (EMERGENCY).");
+  webOverrideCloseRequest = true;  // handled immediately inside emergency block now
+  webPreemptRequested     = true;  // preempt current waits/motion
+  server.sendHeader("Location", "/");
+  server.send(302, "text/plain", "");
+}
+// ====== END UPDATED WEB HANDLERS ======
+
+void handleBridgeFlags() {
+
+    // anchor: start of handleBridgeFlags
+  if (emergencyPending) { 
+    emergencyPending = false; 
+    enterEmergency(); 
+    // continue into the emergencyActive block below this return path
+  }
+
+  //  EMERGENCY 
+  if (emergencyActive) {
+    stopMotor();
+
+    // Siren
+    if (millis() - lastSirenTime >= 10) {
+      lastSirenTime = millis();
+      if (sirenDirection) {
+        sirenFreq += 20;
+        if (sirenFreq >= 1200) sirenDirection = false;
+      } else {
+        sirenFreq -= 20;
+        if (sirenFreq <= 800) sirenDirection = true;
+      }
+      tone(buzzerPin, sirenFreq);
+    }
+
+    // Flash lights red
+    if (millis() - lastFlashTime >= 500) {
+      flashState = !flashState;
+      lastFlashTime = millis();
+      if (flashState) {
+        setAll(strip2, strip2.Color(255,0,0)); strip2.show();
+        setAll(strip1, strip1.Color(255,0,0)); strip1.show();
+      } else {
+        setAll(strip1, strip1.Color(0,0,0));
+        setAll(strip2, strip2.Color(0,0,0));
+      }
+    }
+
+    Serial.println("EMERGENCY STOP ACTIVE");
+
+    // --- Web overrides honored during EMERGENCY (mirror manual behavior) ---
+    if (webOverrideOpenRequest) {
+      Serial.println("Web Override (EMERGENCY): OPEN bridge");
+      webOverrideOpenRequest = false;
+      stopMotor();
+      noTone(buzzerPin);
+      // show both red briefly for UI consistency
+      setAll(strip2, strip2.Color(255, 0, 0)); strip2.show();
+      setAll(strip1, strip1.Color(255, 0, 0)); strip1.show();
+      delay(300);
+
+      emergencyActive = false;           // leave emergency before motion
+      webPreemptRequested = false;       // <<< FIX: consume preempt so waits resume normally
+
+      bool hitOpen = driveUntilLimit(backward, 255, limitSwitchOpen, 15000);
+      if (!hitOpen) Serial.println("WARNING: Open limit not reached.");
+
+      setAll(strip1, strip1.Color(0, 255, 0)); strip1.show();  // Boats green
+      setAll(strip2, strip2.Color(255, 0, 0)); strip2.show();  // Cars red
+      bridgeOpen      = true;
+      motorDirection  = false;
+      bridgeOpenTime  = millis();
+      return;
+    }
+
+    if (webOverrideCloseRequest) {
+      Serial.println("Web Override (EMERGENCY): CLOSE bridge");
+      webOverrideCloseRequest = false;
+      stopMotor();
+      noTone(buzzerPin);
+      setAll(strip1, strip1.Color(255, 0, 0)); strip1.show();  // Boats red
+      delay(300);
+
+      emergencyActive = false;           // leave emergency before motion
+      webPreemptRequested = false;       // <<< FIX: consume preempt
+
+      // ===== CHANGED: choose direction based on motorDirection =====
+      bool hitClose = false;
+      if (motorDirection == false) {
+        // last open was backward -> close forward
+        hitClose = driveUntilLimit(forward, 255, limitSwitchClose, 15000);
+      } else {
+        // last open was forward -> close backward
+        hitClose = driveUntilLimit(backward, 255, limitSwitchClose, 15000);
+      }
+      // ===== END CHANGE =====
+
+      if (!hitClose) Serial.println("WARNING: Close limit not reached.");
+
+      setAll(strip2, strip2.Color(0, 255, 0)); strip2.show();  // Cars green
+      setAll(strip1, strip1.Color(255, 0, 0)); strip1.show();  // Boats red
+      bridgeOpen = false;
+      return;
+    }
+    // -----------------------------------------------------------------------
+
+    // Manual override buttons during emergency still work
+    if (digitalRead(OVERRIDE_OPEN_PIN) == LOW)  { bridgeOpenRequest = true; emergencyActive = false; }
+    if (digitalRead(OVERRIDE_CLOSE_PIN) == LOW) { bridgeCloseRequest = true; emergencyActive = false; }
+
+    delay(100); // short dwell
+    return; // skip other logic while emergency
+  }
+
+  noTone(buzzerPin); // turn off siren if not emergency
+
+  // ----- BRIDGE OPEN REQUEST -----
+  if (webOverrideOpenRequest || bridgeOpenRequest) {
+    webOverrideOpenRequest = false;
+    bridgeOpenRequest = false;
+    webPreemptRequested = false;   // <-- consume preempt
+
+    Serial.println("Bridge OPEN request received");
+    stopMotor();
+    setAll(strip2, strip2.Color(255,0,0)); strip2.show();
+    setAll(strip1, strip1.Color(255,0,0)); strip1.show();
+    if (!waitWithEmergency(300)) return;
+
+    bool hitOpen = driveUntilLimit(backward, 255, limitSwitchOpen, 15000);
+    if (!hitOpen) Serial.println("WARNING: Open limit not reached.");
+
+    setAll(strip1, strip1.Color(0,255,0)); strip1.show();
+    setAll(strip2, strip2.Color(255,0,0)); strip2.show();
+    bridgeOpen = true;
+    motorDirection = false;
+    bridgeOpenTime = millis();
+  }
+
+  //  BRIDGE CLOSE REQUEST 
+  if (webOverrideCloseRequest || bridgeCloseRequest) {
+    webOverrideCloseRequest = false;
+    bridgeCloseRequest = false;
+    webPreemptRequested = false;   // <-- consume preempt
+
+    Serial.println("Bridge CLOSE request received");
+    stopMotor();
+    setAll(strip1, strip1.Color(255,0,0)); strip1.show();
+    delay(300);
+
+    // ===== CHANGED: choose direction based on motorDirection =====
+    bool hitClose = false;
+    if (motorDirection == false) {
+      // last open was backward -> close forward
+      hitClose = driveUntilLimit(forward, 255, limitSwitchClose, 15000);
+    } else {
+      // last open was forward -> close backward
+      hitClose = driveUntilLimit(backward, 255, limitSwitchClose, 15000);
+    }
+    // ===== END CHANGE =====
+
+    if (!hitClose) Serial.println("WARNING: Close limit not reached.");
+
+    setAll(strip2, strip2.Color(0,255,0)); strip2.show();
+    setAll(strip1, strip1.Color(255,0,0)); strip1.show();
+    bridgeOpen = false;
+  }
+}
+
+void webLoop() {
+  server.handleClient();
+}
+
+//  Unified Arduino setup/loop 
+void setup() {
+  // IMPORTANT: Init our log-mirroring Serial first so WorkingLogic prints are captured.
+  Serial.begin(115200);
+  logicSetup();
+  setupWebServer();
+}
+ 
+void loop() {
+  // Service web requests continuously for best responsiveness
+  webLoop();
+  if (emergencyPending) { emergencyPending = false; enterEmergency(); }  // NEW
+  handleBridgeFlags();
+  if (emergencyActive) return;
+  logicLoop();      // run the untouched bridge logic (with patched emergency block)
+  // webLoop() also called frequently inside waits/motion
+}
