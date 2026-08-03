@@ -16,7 +16,7 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
 
-  Serial.println("ESP32 simple test starting...");
+  Serial.println("test");
 
   for (int i = 0; i < 3; ++i) {
     blinkOnce(150);
