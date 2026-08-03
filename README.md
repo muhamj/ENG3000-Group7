@@ -11,3 +11,5 @@
 ### Software
 - Aim to use Platform IO
 - Python + PY Game?
+
+##Basic Basis Understanding of the Wack a Mole Game
