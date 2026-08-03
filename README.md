@@ -1,6 +1,5 @@
-# ENG3000-Group7
-
-## Basic Understanding of the Wack a Mole game
+# Basic Understanding of the Wack a Mole game
+----------------------------------------------
 ### LED
 - LED/ Displays going to be on the wall
   * Display and User interface is to be done by SE (but check in with electrical for placement and sensor understanding)
