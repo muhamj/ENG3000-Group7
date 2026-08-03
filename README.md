@@ -10,3 +10,4 @@
 
 ### Software
 - Aim to use Platform IO
+- Python + PY Game?
