@@ -17,19 +17,19 @@
 
 ----------------------------------------------
 # The assessment of the Whack-a-Mole system will be based on the following criteria:
-1. Full Functionality
+## 1. Full Functionality
    - Sends sensor data wirelessly to the PC
    - Runs on and recharges supplied batteries
    - Integrates sensor data into calibrated spatial positioning
    - Alarm when within 50cm of screen
    - Original Whack-a-Mole game with levels
    - Play the Whack-a-Mole game based on sensor data
-2. Performance Benchmarks
+## 2. Performance Benchmarks
    - Sensors less than 100 mm x 100 mm x 50 mm
    - Current consumption and battery data show life > 1 hour
    - Person tracking is suƯiciently accurate to play game
    - Person tracking is suƯiciently responsive to play game
-3. Design and Manufacture
+## 3. Design and Manufacture
    - Code can be downloaded and installed on a Windows laptop.
    - Sensors have neat external appearance
    - Sensors have sound electronic construction
