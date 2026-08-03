@@ -1,6 +1,6 @@
 # ENG3000-Group7
 
-## main plan
+## Basic Understanding of the Wack a Mole game
 ### LED
 - LED/ Displays going to be on the wall
 
@@ -11,3 +11,4 @@
 ### Software
 - Aim to use Platform IO
 - Python + PY Game?
+ 
