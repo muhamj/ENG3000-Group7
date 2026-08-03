@@ -1,5 +1,6 @@
 # Basic Understanding of the Wack a Mole game
 ----------------------------------------------
+## Eqiupment Use
 ### LED
 - LED/ Displays going to be on the wall
   * Display and User interface is to be done by SE (but check in with electrical for placement and sensor understanding)
@@ -14,7 +15,8 @@
 - Python + PY Game?
 - Arduino (possibly no ESP 32)
 
-## The assessment of the Whack-a-Mole system will be based on the following criteria:
+----------------------------------------------
+# The assessment of the Whack-a-Mole system will be based on the following criteria:
 1. Full Functionality
    - Sends sensor data wirelessly to the PC
    - Runs on and recharges supplied batteries
