@@ -1,50 +1,43 @@
 #include <Arduino.h>
-#include <WiFi.h>
 
-const char* ssid = "Austin's Phone";
-const char* password = "123456789";
+const int SENSOR_TRIG_PIN = 12;
+const int SENSOR_ECHO_PIN = 13;
+const int LED_PIN = 2;
 
-void blinkOnce(int delayMs) {
-  digitalWrite(LED_BUILTIN, HIGH);
-  delay(delayMs);
-  digitalWrite(LED_BUILTIN, LOW);
-  delay(delayMs);
+float readSingleSensorDistance() {
+  digitalWrite(SENSOR_TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(SENSOR_TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(SENSOR_TRIG_PIN, LOW);
+
+  long duration = pulseIn(SENSOR_ECHO_PIN, HIGH, 30000);
+  if (duration <= 0) {
+    return -1.0;
+  }
+
+  return duration * 0.0343f / 2.0f;
 }
 
 void setup() {
-  pinMode(LED_BUILTIN, OUTPUT);
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(SENSOR_TRIG_PIN, OUTPUT);
+  pinMode(SENSOR_ECHO_PIN, INPUT);
   Serial.begin(115200);
   delay(1000);
-
-  Serial.println("test");
-
-  for (int i = 0; i < 3; ++i) {
-    blinkOnce(150);
-  }
-
-  Serial.print("Connecting to Wi-Fi: ");
-  Serial.println(ssid);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-
-  for (int i = 0; i < 20; ++i) {
-    if (WiFi.status() == WL_CONNECTED) {
-      break;
-    }
-    blinkOnce(200);
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("Wi-Fi connected");
-  } else {
-    Serial.println("Wi-Fi connection failed");
-  }
+  Serial.println("ESP32 sensor test: TRIG=12, ECHO=13");
 }
 
 void loop() {
-  if (WiFi.status() == WL_CONNECTED) {
-    blinkOnce(1000);
+  digitalWrite(LED_PIN, HIGH);
+  float distance = readSingleSensorDistance();
+  if (distance < 0) {
+    Serial.println("distance: NaN");
   } else {
-    blinkOnce(250);
+    Serial.print("distance: ");
+    Serial.print(distance, 2);
+    Serial.println(" cm");
   }
+  digitalWrite(LED_PIN, LOW);
+  delay(1000);
 }
