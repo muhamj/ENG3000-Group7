@@ -1,5 +1,13 @@
 # Basic Understanding of the Wack a Mole game
 ----------------------------------------------
+## The following components can be used (and will be supplied):
+- ESP32 processor boards
+- Ultrasonic sensors – RCWL-1601
+- 3 x AA NiMH batteries
+- 3 x AA battery holder
+- Perf board
+- Connectors
+ 
 ## Eqiupment Use
 ### LED
 - LED/ Displays going to be on the wall
@@ -35,3 +43,8 @@
    - Sensors have sound electronic construction
    - Supplied components are returned in good working order
    - No solder, adhesives, paint or other like material has been applied to the supplied components 
+
+
+
+# Functionality
+
