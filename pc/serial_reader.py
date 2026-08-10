@@ -1,25 +1,76 @@
 ﻿import argparse
 import sys
-import time
 
 try:
     import serial
     import serial.tools.list_ports
 except ImportError:
-    print('Please install pyserial: pip install pyserial')
-    sys.exit(1)
+    serial = None
 
 
 def list_serial_ports():
+    if serial is None:
+        return []
     return [port.device for port in serial.tools.list_ports.comports()]
 
 
-def open_serial_port(port, baudrate):
-    try:
-        return serial.Serial(port, baudrate, timeout=1)
-    except serial.SerialException as exc:
-        print(f'Error opening {port}: {exc}')
+def find_serial_port():
+    ports = list_serial_ports()
+    return ports[0] if ports else None
+
+
+def parse_distance_line(line):
+    text = line.strip().lower()
+    if not text.startswith('distance:'):
         return None
+    try:
+        value = text.split(':', 1)[1].strip().split(' ')[0]
+        return float(value)
+    except ValueError:
+        return None
+
+
+class SerialDistanceReader:
+    def __init__(self, port=None, baudrate=115200, timeout=0.1):
+        self.serial = None
+        self.port = port or find_serial_port()
+        self.baudrate = baudrate
+        self.timeout = timeout
+
+    def open(self):
+        if serial is None or self.port is None:
+            return False
+        try:
+            self.serial = serial.Serial(self.port, self.baudrate, timeout=self.timeout)
+            return True
+        except serial.SerialException:
+            self.serial = None
+            return False
+
+    def read_distance(self):
+        if self.serial is None:
+            return None
+        try:
+            line = self.serial.readline().decode('utf-8', errors='replace').strip()
+            return parse_distance_line(line)
+        except serial.SerialException:
+            self.close()
+            return None
+
+    def close(self):
+        if self.serial is not None:
+            try:
+                self.serial.close()
+            except Exception:
+                pass
+            self.serial = None
+
+
+def open_serial_reader(port=None, baudrate=115200, timeout=0.1):
+    reader = SerialDistanceReader(port=port, baudrate=baudrate, timeout=timeout)
+    if reader.open():
+        return reader
+    return None
 
 
 def main():
@@ -28,33 +79,21 @@ def main():
     parser.add_argument('--baud', help='Baud rate', type=int, default=115200)
     args = parser.parse_args()
 
-    port = args.port
-    if port is None:
-        ports = list_serial_ports()
-        if not ports:
-            print('No serial ports found. Connect the ESP32 and try again.')
-            sys.exit(1)
-        print('Available serial ports:')
-        for p in ports:
-            print('  ' + p)
-        port = ports[0]
-        print(f'Using first port: {port}')
-
-    ser = open_serial_port(port, args.baud)
-    if ser is None:
+    reader = open_serial_reader(port=args.port, baudrate=args.baud)
+    if reader is None:
+        print('Failed to open serial port. Connect the ESP32 and try again.')
         sys.exit(1)
 
-    print(f'Listening on {port} at {args.baud} baud...')
+    print(f'Listening on {reader.port} at {reader.baudrate} baud...')
     try:
         while True:
-            line = ser.readline().decode('utf-8', errors='replace').strip()
-            if not line:
-                continue
-            print(line)
+            distance = reader.read_distance()
+            if distance is not None:
+                print(f'distance: {distance:.2f}')
     except KeyboardInterrupt:
         print('\nStopped by user')
     finally:
-        ser.close()
+        reader.close()
 
 
 if __name__ == '__main__':
