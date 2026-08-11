@@ -125,7 +125,7 @@ def main():
     elif serial is None:
         print('pyserial not installed. Serial reading is disabled.')
     else:
-        print('No serial port found. Connect the ESP32 and try again.')
+        print('Serial Port not found')
 
     distance_cm = None
     clock = pygame.time.Clock()
@@ -141,7 +141,7 @@ def main():
                 distance_cm = dist
                 print(f'Received distance: {distance_cm}')
             else:
-                print('No valid distance from serial this frame')
+                print('NaN')
 
         show_mole = distance_cm is None or distance_cm > 5.0
 
