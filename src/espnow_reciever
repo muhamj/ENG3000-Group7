@@ -1,0 +1,86 @@
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_arduino_version.h>
+
+struct MessageData {
+  char message[50];
+  int number;
+};
+
+MessageData receivedMessage;
+
+void processReceivedData(
+  const uint8_t *incomingData,
+  int length
+) {
+  if (length != sizeof(MessageData)) {
+    Serial.println("Received data has the wrong size");
+    return;
+  }
+
+  memcpy(
+    &receivedMessage,
+    incomingData,
+    sizeof(receivedMessage)
+  );
+
+  Serial.println("--------------------");
+  Serial.println("Message received!");
+
+  Serial.print("Text: ");
+  Serial.println(receivedMessage.message);
+
+  Serial.print("Number: ");
+  Serial.println(receivedMessage.number);
+}
+
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+
+void onDataReceived(
+  const esp_now_recv_info_t *info,
+  const uint8_t *incomingData,
+  int length
+) {
+  processReceivedData(incomingData, length);
+}
+
+#else
+
+void onDataReceived(
+  const uint8_t *macAddress,
+  const uint8_t *incomingData,
+  int length
+) {
+  processReceivedData(incomingData, length);
+}
+
+#endif
+
+void setup() {
+  Serial.begin(115200);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
+  delay(1000);
+
+  Serial.println("Starting ESP-NOW receiver");
+
+  Serial.print("Receiver MAC address: ");
+  Serial.println(WiFi.macAddress());
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW initialisation failed");
+    return;
+  }
+
+  esp_now_register_recv_cb(onDataReceived);
+
+  Serial.println("Receiver ready");
+  Serial.println("Waiting for messages...");
+}
+
+void loop() {
+  // Messages are handled by onDataReceived().
+  delay(100);
+}
