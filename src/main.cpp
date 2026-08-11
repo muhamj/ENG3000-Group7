@@ -1,7 +1,7 @@
 #include <Arduino.h>
 
-const int SENSOR_TRIG_PIN = 12;
-const int SENSOR_ECHO_PIN = 13;
+const int SENSOR_TRIG_PIN = 32;
+const int SENSOR_ECHO_PIN = 35;
 const int LED_PIN = 2;
 
 float readSingleSensorDistance() {

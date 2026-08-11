@@ -1,4 +1,6 @@
 ﻿import argparse
+import math
+import re
 import sys
 
 try:
@@ -21,11 +23,12 @@ def find_serial_port():
 
 def parse_distance_line(line):
     text = line.strip().lower()
-    if not text.startswith('distance:'):
+    match = re.match(r'^distance\s*:\s*([-+]?[0-9]*\.?[0-9]+|nan)', text)
+    if not match:
         return None
     try:
-        value = text.split(':', 1)[1].strip().split(' ')[0]
-        return float(value)
+        value = float(match.group(1))
+        return None if math.isnan(value) else value
     except ValueError:
         return None
 
