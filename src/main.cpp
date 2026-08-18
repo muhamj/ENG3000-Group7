@@ -1,8 +1,12 @@
-#include <Arduino.h>
+﻿#include <Arduino.h>
+#include <WiFi.h>
+
 
 const int SENSOR_TRIG_PIN = 32;
 const int SENSOR_ECHO_PIN = 35;
 const int LED_PIN = 2;
+
+float lastDistanceCm = -1.0;
 
 float readSingleSensorDistance() {
   digitalWrite(SENSOR_TRIG_PIN, LOW);
@@ -25,7 +29,10 @@ void setup() {
   pinMode(SENSOR_ECHO_PIN, INPUT);
   Serial.begin(115200);
   delay(1000);
-  Serial.println("ESP32 sensor test: TRIG=12, ECHO=13");
+  Serial.println("ESP32 sensor test: TRIG=32, ECHO=35");
+
+  Serial.print("ESP32 MAC Address: ");
+  Serial.println(WiFi.macAddress());
 }
 
 void loop() {
@@ -33,10 +40,12 @@ void loop() {
   float distance = readSingleSensorDistance();
   if (distance < 0) {
     Serial.println("distance: NaN");
+    lastDistanceCm = -1.0;
   } else {
     Serial.print("distance: ");
     Serial.print(distance, 2);
     Serial.println(" cm");
+    lastDistanceCm = distance;
   }
   digitalWrite(LED_PIN, LOW);
   delay(1000);
