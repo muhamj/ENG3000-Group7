@@ -77,7 +77,7 @@ void setup() {
 
   Serial.println("ESP32 dual sensor test");
   Serial.println("Sensor 1: TRIG=32, ECHO=35");
-  Serial.println("Sensor 2: TRIG=12, ECHO=13");
+  Serial.println("Sensor 2: TRIG=12, ECHO=14");
 
   Serial.print("ESP32 MAC Address: ");
   Serial.println(WiFi.macAddress());
