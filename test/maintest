@@ -5,7 +5,7 @@
 const int SENSOR_1_TRIG_PIN = 32;
 const int SENSOR_1_ECHO_PIN = 35;
 const int SENSOR_2_TRIG_PIN = 12;
-const int SENSOR_2_ECHO_PIN = 13;
+const int SENSOR_2_ECHO_PIN = 14;
 const int LED_PIN = 2;
 
 
