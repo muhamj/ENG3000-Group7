@@ -1,4 +1,4 @@
-﻿import math
+import math
 import os
 import random
 import re
@@ -19,10 +19,28 @@ TITLE_IMAGE = os.path.join(IMAGES_DIR, "title.png")
 MOLE_IMAGE = os.path.join(IMAGES_DIR, "mole.png")
 HAMMER_IMAGE = os.path.join(IMAGES_DIR, "hammer.png")
 MOLE_DEAD_IMAGE = os.path.join(IMAGES_DIR, "mole dead.png")
+HELP_BUTTON_IMAGE = os.path.join(IMAGES_DIR, "help button.png")
+GO_BACK_BUTTON_IMAGE = os.path.join(IMAGES_DIR, "go back button.png")
+EASY_IMAGE = os.path.join(IMAGES_DIR, "easy.png")
+MEDIUM_IMAGE = os.path.join(IMAGES_DIR, "medium.png")
+HARD_IMAGE = os.path.join(IMAGES_DIR, "hard.png")
 
 WINDOW_WIDTH = 800
 WINDOW_HEIGHT = 800
 HIT_DISTANCE_CM = 5.0
+SENSOR_MAX_DISTANCE_CM = 500.0
+SENSOR_TIMEOUT_MS = 500
+# All four sensors are mounted along the top edge. The two sensors in each
+# box are angled differently, so calibrate their horizontal zones separately.
+SENSOR_COLUMN_MAP = {
+    "s1a": 0,
+    "s1b": 1,
+    "s2a": 1,
+    "s2b": 2,
+}
+# Approximate distance bands based on a 0.6 m sensor height and 1.4 m deep
+# play area. Replace these with measured values after mounting the boxes.
+DEPTH_ROW_THRESHOLDS_CM = (100.0, 160.0)
 SCREEN_MARGIN = 20
 MOLE_MAX_WIDTH = 120
 MOLE_MAX_HEIGHT = 120
@@ -62,16 +80,35 @@ def find_serial_port():
 
 
 def parse_distance_line(line):
+    """Parse the four-value frame emitted by the master ESP32."""
     text = line.strip().lower()
-    match = re.match(r"^distance\s*:\s*([-+]?[0-9]*\.?[0-9]+|nan)", text)
-    if not match:
+    if not text.startswith("distances:"):
         return None
 
-    try:
-        value = float(match.group(1))
-        return None if math.isnan(value) else value
-    except ValueError:
+    distances = {}
+    for name, value_text in re.findall(
+        r"(s[12][ab])\s*=\s*([-+]?(?:[0-9]*\.)?[0-9]+|nan)",
+        text,
+    ):
+        try:
+            value = float(value_text)
+        except ValueError:
+            continue
+        if not math.isnan(value) and 0 < value <= SENSOR_MAX_DISTANCE_CM:
+            distances[name] = value
+
+    if len(distances) != 4:
         return None
+    return distances
+
+
+def nearest_sensor_cell(distances):
+    """Map top-edge sensor readings to a coarse 3x3 grid cell."""
+    nearest_name = min(distances, key=distances.get)
+    nearest_distance = distances[nearest_name]
+    row = sum(nearest_distance > threshold for threshold in DEPTH_ROW_THRESHOLDS_CM)
+    column = SENSOR_COLUMN_MAP[nearest_name]
+    return row * GRID_SIZE + column
 
 
 class SerialDistanceReader:
@@ -96,7 +133,7 @@ class SerialDistanceReader:
             self.serial = None
             return False
 
-    def read_distance(self):
+    def read_distances(self):
         if self.serial is None:
             return None
 
@@ -238,6 +275,15 @@ def draw_label(screen, label_font, grid_start_x, grid_start_y, cell_size, text, 
     screen.blit(surf, (cx - surf.get_width() // 2, cy - surf.get_height() // 2))
 
 
+def draw_image_in_cell(screen, image, grid_start_x, grid_start_y, cell_size, cell_index):
+    """Draw an image centred and contained within a grid cell."""
+    col = cell_index % GRID_SIZE
+    row = cell_index // GRID_SIZE
+    cx = int(grid_start_x + col * cell_size + cell_size / 2)
+    cy = int(grid_start_y + row * cell_size + cell_size / 2)
+    screen.blit(image, (cx - image.get_width() // 2, cy - image.get_height() // 2))
+
+
 # =============================================================================
 # MAIN GAME LOOP
 # =============================================================================
@@ -302,6 +348,32 @@ def main():
         menu_title_surface,
         (menu_title_width, menu_title_height),
     )
+    button_image_size = max(1, int(cell_size * 0.8))
+    help_button_surface = scale_to_fit(
+        load_image(HELP_BUTTON_IMAGE).convert_alpha(),
+        button_image_size,
+        button_image_size,
+    )
+    go_back_button_surface = scale_to_fit(
+        load_image(GO_BACK_BUTTON_IMAGE).convert_alpha(),
+        button_image_size,
+        button_image_size,
+    )
+    easy_surface = scale_to_fit(
+        load_image(EASY_IMAGE).convert_alpha(),
+        button_image_size,
+        button_image_size,
+    )
+    medium_surface = scale_to_fit(
+        load_image(MEDIUM_IMAGE).convert_alpha(),
+        button_image_size,
+        button_image_size,
+    )
+    hard_surface = scale_to_fit(
+        load_image(HARD_IMAGE).convert_alpha(),
+        button_image_size,
+        button_image_size,
+    )
     mole_cell_index = random.randint(0, GRID_SIZE * GRID_SIZE - 1)
     mole_state = "alive"  # 'alive' or 'dead'
     mole_dead_until = 0
@@ -328,7 +400,7 @@ def main():
     hammer_winding = False
     hammer_wind_start = 0
 
-    reader = open_serial_reader(port="COM4")
+    reader = open_serial_reader()
     if reader is not None:
         print(f"Using serial port: {reader.port}")
     elif serial is None:
@@ -340,6 +412,8 @@ def main():
     running = True
     mouse_focused = False
     mouse_pos = (0, 0)
+    sensor_cell = None
+    sensor_last_update = 0
 
     while running:
         for event in pygame.event.get():
@@ -354,7 +428,18 @@ def main():
             mouse_focused = False
             mouse_pos = (0, 0)
 
-        # Determine mouse cell if inside grid
+        # Convert the nearest sensor into the same cell input used by menus/game.
+        if reader is not None:
+            distances = reader.read_distances()
+            if distances is not None:
+                sensor_cell = nearest_sensor_cell(distances)
+                sensor_last_update = pygame.time.get_ticks()
+                print(
+                    "Sensor position: "
+                    f"cell={sensor_cell} nearest={min(distances, key=distances.get)}"
+                )
+
+        # Sensor input takes priority when a complete frame is available.
         mx, my = mouse_pos
         grid_size_pixels = int(cell_size * GRID_SIZE)
         if (
@@ -365,11 +450,22 @@ def main():
         ):
             mcol = int((mx - grid_start_x) // cell_size)
             mrow = int((my - grid_start_y) // cell_size)
-            mouse_cell = mrow * GRID_SIZE + mcol
+            mouse_cell = sensor_cell if sensor_cell is not None else mrow * GRID_SIZE + mcol
         else:
-            mouse_cell = None
+            mouse_cell = sensor_cell
+
+        control_pos = mouse_pos
+        if sensor_cell is not None:
+            sensor_col = sensor_cell % GRID_SIZE
+            sensor_row = sensor_cell // GRID_SIZE
+            control_pos = (
+                int(grid_start_x + (sensor_col + 0.5) * cell_size),
+                int(grid_start_y + (sensor_row + 0.5) * cell_size),
+            )
 
         now = pygame.time.get_ticks()
+        if now - sensor_last_update > SENSOR_TIMEOUT_MS:
+            sensor_cell = None
 
         # endregion
 
@@ -408,7 +504,12 @@ def main():
         if state == STATE_SELECT_DIFFICULTY:
             # Select difficulty on entering grid squares 1,3,5
             if mouse_cell != prev_mouse_cell and mouse_cell is not None:
-                if mouse_cell == 1:
+                if mouse_cell == 7:
+                    hammer_pressed = True
+                    hammer_press_start = now
+                    state = STATE_MAIN_MENU
+                    print("Returned to main menu")
+                elif mouse_cell == 1:
                     selected = "HARD"
                 elif mouse_cell == 3:
                     selected = "EASY"
@@ -438,6 +539,13 @@ def main():
         
         # Will need to include demo on how it works
 
+        if state == STATE_DEMO and mouse_cell != prev_mouse_cell and mouse_cell == 8:
+            hammer_pressed = True
+            hammer_press_start = now
+            state = STATE_MAIN_MENU
+            demo_active = False
+            print("Returned to main menu")
+
 
         # endregion
 
@@ -461,28 +569,8 @@ def main():
                 if mole_state == "alive":
                     mole_state = "dead"
                     score += 1
-                    mole_dead_until = now + MOLE_DEAD_DISPLAY_MS
-                    mole_expire_time = mole_dead_until
-                    print(f"MoleDead.png shows until {mole_dead_until}.")
+                    print(f"Hit! {score} points.")
 
-
-        # endregion
-
-        # region GAME SCREEN - SERIAL SENSOR INPUT
-        # Sensor input only applies while the actual game is running.
-        if state == STATE_GAME and reader is not None:
-            distance_cm = reader.read_distance()
-
-            if distance_cm is not None:
-                print(f"Received distance: {distance_cm:.2f} cm")
-
-                if distance_cm <= HIT_DISTANCE_CM and mole_state != "dead":
-                    previous_index = mole_cell_index
-                    mole_cell_index = random_grid_index(previous_index)
-                    now = pygame.time.get_ticks()
-                    mole_state = "alive"
-                    mole_expire_time = now + random.randint(MOLE_MIN_CURRENT, MOLE_MAX_CURRENT)
-                    print(f"Sensor hit: mole moved to square {mole_cell_index}.")
 
         # endregion
 
@@ -527,8 +615,8 @@ def main():
         # SCREEN 1 - MAIN MENU
         # ---------------------------------------------------------------------
         if state == STATE_MAIN_MENU:
-            draw_label(screen, label_font, grid_start_x, grid_start_y, cell_size, "Start", 4)
-            draw_label(screen, label_font, grid_start_x, grid_start_y, cell_size, "Demo", 7)
+            draw_image_in_cell(screen, mole_alive, grid_start_x, grid_start_y, cell_size, 4)
+            draw_image_in_cell(screen, help_button_surface, grid_start_x, grid_start_y, cell_size, 7)
             title_overlap = int(menu_title_surface.get_height() * 0.23)
             title_draw_y = grid_start_y - title_overlap - 130
             title_draw_x = (WINDOW_WIDTH - menu_title_surface.get_width()) // 2
@@ -539,15 +627,17 @@ def main():
         # SCREEN 2 - DIFFICULTY SELECTION
         # ---------------------------------------------------------------------
         if state == STATE_SELECT_DIFFICULTY:
-            draw_label(screen, label_font, grid_start_x, grid_start_y, cell_size, "Hard", 1)
-            draw_label(screen, label_font, grid_start_x, grid_start_y, cell_size, "Easy", 3)
-            draw_label(screen, label_font, grid_start_x, grid_start_y, cell_size, "Medium", 5)
+            draw_image_in_cell(screen, hard_surface, grid_start_x, grid_start_y, cell_size, 1)
+            draw_image_in_cell(screen, easy_surface, grid_start_x, grid_start_y, cell_size, 3)
+            draw_image_in_cell(screen, medium_surface, grid_start_x, grid_start_y, cell_size, 5)
+            draw_image_in_cell(screen, go_back_button_surface, grid_start_x, grid_start_y, cell_size, 7)
 
 
         # ---------------------------------------------------------------------
         # SCREEN 3 - DEMO SCREEN
         # ---------------------------------------------------------------------
         if state == STATE_DEMO:
+            draw_image_in_cell(screen, go_back_button_surface, grid_start_x, grid_start_y, cell_size, 8)
             # show brief instruction lines near the top
             instr_font = pygame.font.SysFont(None, 22)
             lines = [
@@ -586,10 +676,10 @@ def main():
         # region RENDERING - HAMMER CURSOR / ANIMATION
         # The hammer is shared by the playable game and demo.
         # Draw hammer cursor when mouse is focused in the window
-        if hammer_surface is not None and mouse_focused:
+        if hammer_surface is not None and (mouse_focused or sensor_cell is not None):
             pygame.mouse.set_visible(False)
-            hx = int(mouse_pos[0] - hammer_surface.get_width() // 2)
-            hy = int(mouse_pos[1] - hammer_surface.get_height() // 2)
+            hx = int(control_pos[0] - hammer_surface.get_width() // 2)
+            hy = int(control_pos[1] - hammer_surface.get_height() // 2)
 
             # Update press animation state by time
             if hammer_pressed:
@@ -600,15 +690,15 @@ def main():
                 # wind-up: rotate slightly up and offset upward
                 wind_offset = max(4, hammer_surface.get_height() // 8)
                 rotated = pygame.transform.rotate(hammer_surface, 15)
-                rx = int(mouse_pos[0] - rotated.get_width() // 2)
-                ry = int(mouse_pos[1] - rotated.get_height() // 2 - wind_offset)
+                rx = int(control_pos[0] - rotated.get_width() // 2)
+                ry = int(control_pos[1] - rotated.get_height() // 2 - wind_offset)
                 screen.blit(rotated, (rx, ry))
             elif hammer_pressed:
                 # pressed: offset slightly downward and rotate for effect
                 pressed_offset = max(6, hammer_surface.get_height() // 6)
                 rotated = pygame.transform.rotate(hammer_surface, -20)
-                rx = int(mouse_pos[0] - rotated.get_width() // 2)
-                ry = int(mouse_pos[1] - rotated.get_height() // 2 + pressed_offset)
+                rx = int(control_pos[0] - rotated.get_width() // 2)
+                ry = int(control_pos[1] - rotated.get_height() // 2 + pressed_offset)
                 screen.blit(rotated, (rx, ry))
             else:
                 screen.blit(hammer_surface, (hx, hy))
