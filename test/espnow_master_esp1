@@ -1,0 +1,254 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include <esp_arduino_version.h>
+
+const int SENSOR_1_TRIG_PIN = 32;
+const int SENSOR_1_ECHO_PIN = 35;
+const int SENSOR_2_TRIG_PIN = 12;
+const int SENSOR_2_ECHO_PIN = 14;
+const int LED_PIN = 2;
+
+const uint8_t ESPNOW_CHANNEL = 1;
+const unsigned long SLAVE_TIMEOUT_MS = 3000;
+
+// Slave/sender ESP32 MAC address
+const uint8_t SLAVE_MAC[] = {
+  0xC8, 0x2E, 0x18, 0x79, 0x8E, 0x38
+};
+
+struct SensorPacket {
+  uint32_t packetNumber;
+  float sensor3Cm;
+  float sensor4Cm;
+};
+
+SensorPacket receivedPacket;
+
+bool hasReceivedPacket = false;
+uint32_t packetReceivedAt = 0;
+
+portMUX_TYPE packetLock = portMUX_INITIALIZER_UNLOCKED;
+
+
+float readSensorDistance(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  long duration = pulseIn(echoPin, HIGH, 30000);
+
+  if (duration <= 0) {
+    return -1.0f;
+  }
+
+  return duration * 0.0343f / 2.0f;
+}
+
+
+float getClosestValidDistance(float distance1, float distance2) {
+  if (distance1 < 0 && distance2 < 0) {
+    return -1.0f;
+  }
+
+  if (distance1 < 0) {
+    return distance2;
+  }
+
+  if (distance2 < 0) {
+    return distance1;
+  }
+
+  return distance1 < distance2 ? distance1 : distance2;
+}
+
+
+void printDistanceValue(float distance) {
+  if (distance < 0) {
+    Serial.print("NaN");
+  } else {
+    Serial.print(distance, 2);
+    Serial.print(" cm");
+  }
+}
+
+
+bool isSlaveMac(const uint8_t *macAddress) {
+  return memcmp(macAddress, SLAVE_MAC, 6) == 0;
+}
+
+
+// Callback for Arduino ESP32 Core 3.x
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+
+void onDataReceived(
+  const esp_now_recv_info_t *info,
+  const uint8_t *incomingData,
+  int length
+) {
+  const uint8_t *sourceMac = info->src_addr;
+
+#else
+
+// Callback for Arduino ESP32 Core 2.x
+void onDataReceived(
+  const uint8_t *macAddress,
+  const uint8_t *incomingData,
+  int length
+) {
+  const uint8_t *sourceMac = macAddress;
+
+#endif
+
+  if (!isSlaveMac(sourceMac)) {
+    return;
+  }
+
+  if (length != sizeof(SensorPacket)) {
+    return;
+  }
+
+  portENTER_CRITICAL(&packetLock);
+
+  memcpy(
+    &receivedPacket,
+    incomingData,
+    sizeof(receivedPacket)
+  );
+
+  packetReceivedAt = millis();
+  hasReceivedPacket = true;
+
+  portEXIT_CRITICAL(&packetLock);
+}
+
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(LED_PIN, OUTPUT);
+
+  pinMode(SENSOR_1_TRIG_PIN, OUTPUT);
+  pinMode(SENSOR_1_ECHO_PIN, INPUT);
+  pinMode(SENSOR_2_TRIG_PIN, OUTPUT);
+  pinMode(SENSOR_2_ECHO_PIN, INPUT);
+
+  digitalWrite(SENSOR_1_TRIG_PIN, LOW);
+  digitalWrite(SENSOR_2_TRIG_PIN, LOW);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
+  delay(100);
+
+  esp_wifi_set_channel(
+    ESPNOW_CHANNEL,
+    WIFI_SECOND_CHAN_NONE
+  );
+
+  Serial.println("Master ESP32 starting");
+
+  Serial.print("Master MAC address: ");
+  Serial.println(WiFi.macAddress());
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW initialisation failed");
+
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  if (esp_now_register_recv_cb(onDataReceived) != ESP_OK) {
+    Serial.println("Failed to register receive callback");
+
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  Serial.println("Master ready");
+  Serial.println("Waiting for slave readings...");
+}
+
+
+void loop() {
+  digitalWrite(LED_PIN, HIGH);
+
+  // Sensors connected directly to the master.
+  float sensor1Distance = readSensorDistance(
+    SENSOR_1_TRIG_PIN,
+    SENSOR_1_ECHO_PIN
+  );
+
+  delay(60);
+
+  float sensor2Distance = readSensorDistance(
+    SENSOR_2_TRIG_PIN,
+    SENSOR_2_ECHO_PIN
+  );
+
+  SensorPacket packetCopy;
+  bool packetAvailable;
+  uint32_t receivedTime;
+
+  portENTER_CRITICAL(&packetLock);
+
+  packetCopy = receivedPacket;
+  packetAvailable = hasReceivedPacket;
+  receivedTime = packetReceivedAt;
+
+  portEXIT_CRITICAL(&packetLock);
+
+  float sensor3Distance = -1.0f;
+  float sensor4Distance = -1.0f;
+
+  // Only use recent readings from the slave.
+  if (
+    packetAvailable &&
+    millis() - receivedTime <= SLAVE_TIMEOUT_MS
+  ) {
+    sensor3Distance = packetCopy.sensor3Cm;
+    sensor4Distance = packetCopy.sensor4Cm;
+  }
+
+  float closestMasterDistance = getClosestValidDistance(
+    sensor1Distance,
+    sensor2Distance
+  );
+
+  float closestSlaveDistance = getClosestValidDistance(
+    sensor3Distance,
+    sensor4Distance
+  );
+
+  float closestOfAllFour = getClosestValidDistance(
+    closestMasterDistance,
+    closestSlaveDistance
+  );
+
+  Serial.print("distance: ");
+  printDistanceValue(closestOfAllFour);
+
+  Serial.print(" | sensor 1: ");
+  printDistanceValue(sensor1Distance);
+
+  Serial.print(" | sensor 2: ");
+  printDistanceValue(sensor2Distance);
+
+  Serial.print(" | sensor 3: ");
+  printDistanceValue(sensor3Distance);
+
+  Serial.print(" | sensor 4: ");
+  printDistanceValue(sensor4Distance);
+
+  Serial.println();
+
+  digitalWrite(LED_PIN, LOW);
+
+  delay(1000);
+}
