@@ -15,7 +15,7 @@ except ImportError:
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGES_DIR = os.path.join(BASE_DIR, "images")
-TITLE_IMAGE = os.path.join(IMAGES_DIR, "title.jpg")
+TITLE_IMAGE = os.path.join(IMAGES_DIR, "title.png")
 MOLE_IMAGE = os.path.join(IMAGES_DIR, "mole.png")
 
 WINDOW_WIDTH = 800
