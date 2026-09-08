@@ -1,16 +1,10 @@
-import math
+import json
 import os
 import random
-import re
+import socket
 import sys
 
 import pygame
-
-try:
-    import serial
-    import serial.tools.list_ports
-except ImportError:
-    serial = None
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -28,19 +22,24 @@ HARD_IMAGE = os.path.join(IMAGES_DIR, "hard.png")
 WINDOW_WIDTH = 800
 WINDOW_HEIGHT = 800
 HIT_DISTANCE_CM = 5.0
-SENSOR_MAX_DISTANCE_CM = 500.0
+# Sensors are reliable up to ~200cm; readings beyond this are treated as
+# out of range rather than a genuine far reading, so the usable 0-200cm
+# band gets the full left/right and near/far swing instead of being
+# squeezed into a fraction of a much larger nominal range.
+SENSOR_MAX_DISTANCE_CM = 200.0
 SENSOR_TIMEOUT_MS = 500
-# All four sensors are mounted along the top edge. The two sensors in each
-# box are angled differently, so calibrate their horizontal zones separately.
+UDP_PORT = 4210
+# The master's own two sensors are mounted side-by-side (left/right), same
+# depth. Sensor 1 covers the left half of the play area, sensor 2 the right
+# half. Whichever sensor reports the nearer object picks the column;
+# that sensor's own distance picks the row.
 SENSOR_COLUMN_MAP = {
-    "s1a": 0,
-    "s1b": 1,
-    "s2a": 1,
-    "s2b": 2,
+    "sensor1": 0,
+    "sensor2": 2,
 }
-# Approximate distance bands based on a 0.6 m sensor height and 1.4 m deep
-# play area. Replace these with measured values after mounting the boxes.
-DEPTH_ROW_THRESHOLDS_CM = (100.0, 160.0)
+# Depth bands: near/mid/far rows. The far row starts at 100cm, so anyone
+# standing 1m or further back already reads as the back row.
+DEPTH_ROW_THRESHOLDS_CM = (50.0, 100.0)
 SCREEN_MARGIN = 20
 MOLE_MAX_WIDTH = 120
 MOLE_MAX_HEIGHT = 120
@@ -79,25 +78,26 @@ def find_serial_port():
     return ports[0] if ports else None
 
 
-def parse_distance_line(line):
-    """Parse the four-value frame emitted by the master ESP32."""
-    text = line.strip().lower()
-    if not text.startswith("distances:"):
+def parse_udp_packet(data):
+    """Parse a JSON sensor packet sent by the master ESP32 over UDP."""
+    try:
+        packet = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+
+    if not isinstance(packet, dict):
         return None
 
     distances = {}
-    for name, value_text in re.findall(
-        r"(s[12][ab])\s*=\s*([-+]?(?:[0-9]*\.)?[0-9]+|nan)",
-        text,
-    ):
+    for name in ("sensor1", "sensor2"):
         try:
-            value = float(value_text)
-        except ValueError:
+            value = float(packet[name])
+        except (KeyError, TypeError, ValueError):
             continue
-        if not math.isnan(value) and 0 < value <= SENSOR_MAX_DISTANCE_CM:
+        if 0 < value <= SENSOR_MAX_DISTANCE_CM:
             distances[name] = value
 
-    if len(distances) != 4:
+    if len(distances) != 2:
         return None
     return distances
 
@@ -111,61 +111,85 @@ def nearest_sensor_cell(distances):
     return row * GRID_SIZE + column
 
 
-class SerialDistanceReader:
-    def __init__(self, port=None, baudrate=115200, timeout=0.1):
-        self.serial = None
-        self.port = port or find_serial_port()
-        self.baudrate = baudrate
-        self.timeout = timeout
+def sensor_fraction_x(distances):
+    """Blend the two side-by-side sensors into a continuous 0..1 horizontal
+    position. 0.0 = far left (closest to sensor1), 1.0 = far right (closest
+    to sensor2), 0.5 = standing centered between them."""
+    d1 = distances.get("sensor1")
+    d2 = distances.get("sensor2")
+    if d1 is None and d2 is None:
+        return None
+    # Treat a missing reading as "far away" on that side so the position
+    # still leans toward whichever sensor actually has a reading.
+    d1 = SENSOR_MAX_DISTANCE_CM if d1 is None else d1
+    d2 = SENSOR_MAX_DISTANCE_CM if d2 is None else d2
+
+    closeness1 = max(0.0, SENSOR_MAX_DISTANCE_CM - d1)
+    closeness2 = max(0.0, SENSOR_MAX_DISTANCE_CM - d2)
+    total = closeness1 + closeness2
+    if total <= 0:
+        return 0.5
+    # Closer to sensor2 (right) pulls the fraction toward 1.0.
+    return closeness2 / total
+
+
+def sensor_fraction_row(distances):
+    """Pick a row using whichever sensor currently has the nearer reading."""
+    nearest_name = min(distances, key=distances.get)
+    nearest_distance = distances[nearest_name]
+    return sum(nearest_distance > threshold for threshold in DEPTH_ROW_THRESHOLDS_CM)
+
+
+def sensor_cell_from_fraction(fraction_x, row):
+    """Convert a continuous 0..1 horizontal fraction and a row into a 3x3
+    grid cell index, by splitting the width into three equal zones."""
+    column = min(GRID_SIZE - 1, int(fraction_x * GRID_SIZE))
+    return row * GRID_SIZE + column
+
+
+class UdpDistanceReader:
+    """Reads sensor packets sent by the master ESP32 over the phone hotspot."""
+
+    def __init__(self, port=UDP_PORT):
+        self.port = port
+        self.socket = None
 
     def open(self):
-        if serial is None or self.port is None:
-            return False
-
         try:
-            self.serial = serial.Serial(
-                self.port,
-                self.baudrate,
-                timeout=self.timeout,
-            )
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.socket.bind(("0.0.0.0", self.port))
+            self.socket.settimeout(0.1)
             return True
-        except serial.SerialException:
-            self.serial = None
+        except OSError:
+            self.socket = None
             return False
 
     def read_distances(self):
-        if self.serial is None:
+        if self.socket is None:
             return None
 
         try:
-            line = self.serial.readline().decode(
-                "utf-8",
-                errors="replace",
-            ).strip()
-
-            if line:
-                print(f"Serial raw: {line}")
-
-            return parse_distance_line(line)
-        except serial.SerialException:
+            data, _address = self.socket.recvfrom(512)
+        except socket.timeout:
+            return None
+        except OSError:
             self.close()
             return None
 
+        return parse_udp_packet(data)
+
     def close(self):
-        if self.serial is not None:
+        if self.socket is not None:
             try:
-                self.serial.close()
+                self.socket.close()
             except Exception:
                 pass
-            self.serial = None
+            self.socket = None
 
 
-def open_serial_reader(port=None, baudrate=115200, timeout=0.1):
-    reader = SerialDistanceReader(
-        port=port,
-        baudrate=baudrate,
-        timeout=timeout,
-    )
+def open_udp_reader(port=UDP_PORT):
+    reader = UdpDistanceReader(port=port)
 
     if reader.open():
         return reader
@@ -400,13 +424,11 @@ def main():
     hammer_winding = False
     hammer_wind_start = 0
 
-    reader = open_serial_reader()
+    reader = open_udp_reader()
     if reader is not None:
-        print(f"Using serial port: {reader.port}")
-    elif serial is None:
-        print("pyserial not installed. Serial reading is disabled.")
+        print(f"Listening for sensor packets on UDP port {reader.port}")
     else:
-        print("Serial port not found on COM4. Check the USB connection and COM port.")
+        print("Could not open UDP socket for sensor input.")
 
     clock = pygame.time.Clock()
     running = True
@@ -428,16 +450,16 @@ def main():
             mouse_focused = False
             mouse_pos = (0, 0)
 
-        # Convert the nearest sensor into the same cell input used by menus/game.
+        # Blend the two side-by-side sensors into a cell index - both column
+        # and row snap fully to the 3x3 grid, no smoothing.
         if reader is not None:
             distances = reader.read_distances()
             if distances is not None:
-                sensor_cell = nearest_sensor_cell(distances)
+                fraction_x = sensor_fraction_x(distances)
+                row = sensor_fraction_row(distances)
+                sensor_cell = sensor_cell_from_fraction(fraction_x, row)
                 sensor_last_update = pygame.time.get_ticks()
-                print(
-                    "Sensor position: "
-                    f"cell={sensor_cell} nearest={min(distances, key=distances.get)}"
-                )
+                print(f"Sensor position: cell={sensor_cell}")
 
         # Sensor input takes priority when a complete frame is available.
         mx, my = mouse_pos
@@ -458,6 +480,7 @@ def main():
         if sensor_cell is not None:
             sensor_col = sensor_cell % GRID_SIZE
             sensor_row = sensor_cell // GRID_SIZE
+            # Fully snapped to the cell center on both axes.
             control_pos = (
                 int(grid_start_x + (sensor_col + 0.5) * cell_size),
                 int(grid_start_y + (sensor_row + 0.5) * cell_size),
@@ -475,7 +498,7 @@ def main():
         # Start -> Difficulty Selection
         # Demo  -> Demo Screen
         if state == STATE_MAIN_MENU:
-            # Navigate to Select Difficulty (square 4) or Demo (square 7) on enter
+            # Navigate to Select Difficulty (square 4) or Help/Demo (square 3) on enter
             if mouse_cell != prev_mouse_cell and mouse_cell is not None:
                 if mouse_cell == 4:
                     # Play the hammer hit animation when selecting a menu option.
@@ -483,7 +506,7 @@ def main():
                     hammer_press_start = now
                     state = STATE_SELECT_DIFFICULTY
                     print("Entered Select Difficulty screen")
-                elif mouse_cell == 7:
+                elif mouse_cell == 3:
                     # Play the hammer hit animation when selecting a menu option.
                     hammer_pressed = True
                     hammer_press_start = now
@@ -616,7 +639,7 @@ def main():
         # ---------------------------------------------------------------------
         if state == STATE_MAIN_MENU:
             draw_image_in_cell(screen, mole_alive, grid_start_x, grid_start_y, cell_size, 4)
-            draw_image_in_cell(screen, help_button_surface, grid_start_x, grid_start_y, cell_size, 7)
+            draw_image_in_cell(screen, help_button_surface, grid_start_x, grid_start_y, cell_size, 3)
             title_overlap = int(menu_title_surface.get_height() * 0.23)
             title_draw_y = grid_start_y - title_overlap - 130
             title_draw_x = (WINDOW_WIDTH - menu_title_surface.get_width()) // 2
@@ -675,8 +698,9 @@ def main():
 
         # region RENDERING - HAMMER CURSOR / ANIMATION
         # The hammer is shared by the playable game and demo.
-        # Draw hammer cursor when mouse is focused in the window
-        if hammer_surface is not None and (mouse_focused or sensor_cell is not None):
+        # Draw hammer cursor only when we have live sensor input, so mouse
+        # movement never drives it (this is a sensor-controlled cabinet).
+        if hammer_surface is not None and sensor_cell is not None:
             pygame.mouse.set_visible(False)
             hx = int(control_pos[0] - hammer_surface.get_width() // 2)
             hy = int(control_pos[1] - hammer_surface.get_height() // 2)

@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>ESP32 Sensor Dashboard</title>
+<style>
+  * {
+    box-sizing: border-box;
+  }
+
+  body {
+    font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+    background: #0b0e14;
+    color: #e6e8ee;
+    margin: 0;
+    padding: 40px 24px;
+  }
+
+  .wrap { 
+    max-width: 980px;
+    margin: 0 auto;
+  }
+
+  header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 24px;
+  }
+
+  h1 {
+    font-size: 22px;
+    font-weight: 600;
+    margin: 0;
+    letter-spacing: -0.01em;
+  }
+
+  .updated {
+    color: #8891a7;
+    font-size: 13px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 16px;
+    margin-bottom: 28px;
+  }
+
+  .card {
+    background: #141924;
+    border: 1px solid #232a3b;
+    border-radius: 12px;
+    padding: 18px 20px;
+  }
+
+  .card-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 14px;
+  }
+
+  .card-mac {
+    font-family: Consolas, "Courier New", monospace;
+    font-size: 13px;
+    color: #aab3c8;
+  }
+
+  .badge {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    padding: 3px 9px;
+    border-radius: 999px;
+  }
+
+  .badge-online {
+    background: rgba(76, 217, 123, 0.15);
+    color: #4cd97b;
+  }
+
+  .badge-stale {
+    background: rgba(239, 83, 80, 0.15);
+    color: #ef5350;
+  }
+
+  .closest-row {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    margin-bottom: 16px;
+  }
+
+  .closest-value {
+    font-size: 32px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    color: #ffffff;
+  }
+
+  .closest-unit {
+    font-size: 14px;
+    color: #8891a7;
+  }
+
+  .closest-label {
+    font-size: 12px;
+    color: #8891a7;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-left: auto;
+  }
+
+  .sensor-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 8px;
+  }
+
+  .sensor {
+    background: #0b0e14;
+    border: 1px solid #232a3b;
+    border-radius: 8px;
+    padding: 8px 6px;
+    text-align: center;
+  }
+
+  .sensor-label {
+    font-size: 10px;
+    color: #6c7690;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-bottom: 4px;
+  }
+
+  .sensor-value {
+    font-size: 15px;
+    font-variant-numeric: tabular-nums;
+    color: #e6e8ee;
+  }
+
+  .sensor-value.empty {
+    color: #4a5268;
+  }
+
+  .empty-state {
+    text-align: center;
+    padding: 60px 20px;
+    color: #6c7690;
+    border: 1px dashed #232a3b;
+    border-radius: 12px;
+    font-size: 14px;
+  }
+
+  .conn-error {
+    color: #ef5350;
+  }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>ESP32 wireless sensor readings</h1>
+      <div class="updated" id="updated">Waiting for data...</div>
+    </header>
+
+    <div class="cards" id="cards">
+      <div class="empty-state">Waiting for packets from the ESP32 boards...</div>
+    </div>
+  </div>
+
+  <script>
+    const DATA_URL = "/data";
+    const POLL_MS = 500;
+    const STALE_AFTER_S = 5;
+
+    function formatDistance(value) {
+      return value === null || value === undefined
+        ? '<span class="sensor-value empty">--</span>'
+        : `<span class="sensor-value">${value.toFixed(1)}</span>`;
+    }
+
+    function render(packets) {
+      const cardsEl = document.getElementById("cards");
+      const macs = Object.keys(packets).sort();
+
+      if (macs.length === 0) {
+        cardsEl.innerHTML = '<div class="empty-state">Waiting for packets from the ESP32 boards...</div>';
+        return;
+      }
+
+      const now = Date.now() / 1000;
+      cardsEl.innerHTML = macs.map(mac => {
+        const p = packets[mac];
+        const age = now - p.received_at;
+        const online = age < STALE_AFTER_S;
+        const badgeClass = online ? "badge-online" : "badge-stale";
+        const badgeText = online ? "online" : `${Math.round(age)}s ago`;
+        const closest = p.closest === null || p.closest === undefined
+          ? "--"
+          : p.closest.toFixed(1);
+
+        return `<div class="card">
+          <div class="card-top">
+            <span class="card-mac">${mac}</span>
+            <span class="badge ${badgeClass}">${badgeText}</span>
+          </div>
+          <div class="closest-row">
+            <span class="closest-value">${closest}</span>
+            <span class="closest-unit">cm</span>
+            <span class="closest-label">closest</span>
+          </div>
+          <div class="sensor-grid">
+            <div class="sensor">
+              <div class="sensor-label">S1</div>
+              ${formatDistance(p.sensor1)}
+            </div>
+            <div class="sensor">
+              <div class="sensor-label">S2</div>
+              ${formatDistance(p.sensor2)}
+            </div>
+            <div class="sensor">
+              <div class="sensor-label">S3</div>
+              ${formatDistance(p.sensor3)}
+            </div>
+            <div class="sensor">
+              <div class="sensor-label">S4</div>
+              ${formatDistance(p.sensor4)}
+            </div>
+          </div>
+        </div>`;
+      }).join("");
+    }
+
+    async function poll() {
+      try {
+        const response = await fetch(DATA_URL, { cache: "no-store" });
+        const packets = await response.json();
+        render(packets);
+        document.getElementById("updated").textContent =
+          "Updated " + new Date().toLocaleTimeString();
+        document.getElementById("updated").classList.remove("conn-error");
+      } catch (err) {
+        const updatedEl = document.getElementById("updated");
+        updatedEl.textContent = "Can't reach " + DATA_URL";
+        updatedEl.classList.add("conn-error");
+      }
+    }
+
+    poll();
+    setInterval(poll, POLL_MS);
+  </script>
+</body>
+</html>
