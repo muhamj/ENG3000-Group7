@@ -1,90 +1,60 @@
-# Full-Body Whack-a-Mole
+# Whack-a-Mole — Arcade UI/UX Redesign
 
-A full-body, motion-controlled take on the classic arcade game. Players move within a tracked play area to "whack" randomly appearing moles on screen and no controllers, no cameras, just ultrasonic sensing.
+Two things live in this folder:
 
+1. **`whack_a_mole_game.py`** — a real, runnable Pygame build, wired to
+   read actual ultrasonic sensor data (with a mouse fallback for testing
+   without hardware).
+2. **`whack_a_mole_ui_redesign.html`** — a browser mockup of the same
+   design. Double-click to open in any browser.
 
-## Overview
+## Running the Python game
 
-Instead of a handheld controller, the player's on-screen cursor is driven by their body position in a physical play area. Ultrasonic sensors track the player's location and stream that data wirelessly to a PC, which converts it into cursor movement and drives the game logic.
+```bash
+pip install pygame pyserial
+python whack_a_mole_game.py
+```
 
-## Features
+Keep this folder structure as-is:
 
-- **Full-body motion control** — cursor position mapped from real-world player movement
-- **Ultrasonic-only tracking** — no cameras or optical sensors involved
-- **Wireless sensor network** — sensor units communicate to the PC over [Wi-Fi/Bluetooth — *update*]
-- **Progressive difficulty** — multiple levels with increasing mole speed / spawn rate / target size
-- **Dead-zone safety system** — audible alarm + visual warning if the player gets too close to the screen
-- **Battery-powered hardware** — standalone sensor units run on AA NiMH batteries, no wall power
-- **Windows-installable build** — packaged as a standalone application, no dev environment needed to run
+```
+whack_a_mole/
+├── whack_a_mole_game.py
+├── whack_a_mole_ui_redesign.html
+└── assets/
+    ├── logo.png
+    └── fonts/
+        ├── PressStart2P.ttf
+        └── VT323.ttf
+```
 
-## How It Works
+## How it works
 
-1. Ultrasonic sensors (mounted near the screen) continuously measure distance to the player
-2. Each sensor unit reads locally and transmits data wirelessly to the host PC
-3. The PC combines readings from multiple sensors to calculate the player's (x, y) position within the play area
-4. That position drives an on-screen cursor
-5. The game spawns moles at random positions; moving the cursor onto a mole before it disappears scores a point
-6. If the calculated position enters the dead zone near the screen, the system triggers an audible + visual warning
+The whole game — title, difficulty picker, help, and the mole-whacking
+grid — lives inside a single 3x3 area. No separate score/level/time/
+dead-zone bars.
 
-## Hardware
+- **Move the mouse** (or your real ultrasonic sensors, once wired up) to
+  control the hammer cursor.
+- **Hover a difficulty box (Easy / Medium / Hard) for 2 seconds** to
+  select it — no clicking. The hammer visibly winds back the whole time
+  you're hovering, then swings down to "hit" the option once the dwell
+  completes, which is what actually starts the game. Moving away early
+  cancels it.
+- **Hover "?" HELP** to see instructions.
+- Chase lights run the full perimeter of the title banner at all times,
+  and light up around a difficulty box's perimeter while you're hovering
+  it (charging toward selection).
+- Whack moles as they pop up during play. Press `M` to toggle mouse vs.
+  live sensor control, or use a small "MENU" button (top corner during
+  play) to go back and pick a different difficulty.
 
-| Component | Purpose |
-|---|---|
-| [ESP32| Microcontroller per sensor unit, handles sensing + wireless transmission |
-| [RCWL-1601 ultrasonic sensor — *update*] | Distance/position sensing |
-| 4x AA NiMH battery pack | Standalone power per sensor unit (1hr+ runtime) |
-| [Perf board / enclosure — *update*] | Housing per sensor unit (≤100×100×50mm) |
+## Wiring up your real ESP32 sensors
 
+1. **`SERIAL_PORT`** near the top of `whack_a_mole_game.py` — set this to
+   your ESP32's actual COM port / device path.
+2. **`parse_serial_line()`** — assumes lines like `S1: Distance: 9.40 cm`.
+   If your team's format differs, this is the one function to edit.
 
-## Project Structure
-
-/firmware       # Microcontroller code for sensor units
-/game           # PC-side game application
-/docs           # Diagrams, calibration notes, demo media
-
----
-
-# Basic Understanding of the Wack a Mole game
-----------------------------------------------
-## The following components can be used (and will be supplied):
-- 2 x ESP32 processor board ($8 each)
-- 2 x Antennas ($0 each)
-- 4 x Ultrasonic sensor – RCWL-1601 ($5 each)
-- 2 x Battery Pack (each pack incl. 4 AA NiMH batteries and a Battery holder)
-($7 each - discounted price)
-- Perf board
-- Connectors
- 
-## Eqiupment Use
-### LED
-- LED/ Displays going to be on the wall
-  * Display and User interface is to be done by SE (but check in with electrical for placement and sensor understanding)
-### Sensors
-- Push buttons (hopefully)
-- Ultra sonic
-- if not using normal sensors and covering hand over it to select it
-### Software
-- Aim to use Platform IO
-- Python + PY Game?
-- Arduino (possibly no ESP 32)
-----------------------------------------------
-# The assessment of the Whack-a-Mole system will be based on the following criteria:
-## 1. Full Functionality
-   - Sends sensor data wirelessly to the PC
-   - Runs on and recharges supplied batteries
-   - Integrates sensor data into calibrated spatial positioning
-   - Alarm when within 60cm of screen
-   - Original Whack-a-Mole game with levels
-   - Play the Whack-a-Mole game based on sensor data
-## 2. Performance Benchmarks
-   - Sensors less than 100 mm x 100 mm x 50 mm
-   - Current consumption and battery data show life > 1 hour
-   - Person tracking is suƯiciently accurate to play game
-   - Person tracking is suƯiciently responsive to play game
-## 3. Design and Manufacture
-   - Code can be downloaded and installed on a Windows laptop.
-   - Sensors have neat external appearance
-   - Sensors have sound electronic construction
-   - Supplied components are returned in good working order
-   - No solder, adhesives, paint or other like material has been applied to the supplied components 
-# Functionality
+If no serial device is found, the game automatically falls back to mouse
+control instead of crashing.
