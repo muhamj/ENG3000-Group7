@@ -1,9 +1,9 @@
 import json
+import math
 import os
 import random
+import socket
 import sys
-import urllib.error
-import urllib.request
 
 import pygame
 
@@ -24,33 +24,30 @@ WINDOW_WIDTH = 800
 WINDOW_HEIGHT = 800
 HIT_DISTANCE_CM = 5.0
 # Sensors are reliable up to ~200cm; readings beyond this are treated as
-# out of range rather than a genuine far reading, so the usable 0-200cm
-# band gets the full left/right and near/far swing instead of being
-# squeezed into a fraction of a much larger nominal range.
+# out of range rather than a genuine far reading.
 SENSOR_MAX_DISTANCE_CM = 200.0
 SENSOR_TIMEOUT_MS = 500
+UDP_PORT = 4210
 
-# game_wifi.py no longer binds its own UDP socket - sensor_monitor.py owns
-# port 4210 and is the single process that reads the ESP32's UDP packets.
-# This reads sensor_monitor.py's HTTP /data endpoint instead, so both
-# programs can run at the same time without fighting over the same port.
-# sensor_monitor.py must be running (with its HTTP dashboard enabled,
-# i.e. not started with --no-http) for the game to get sensor data.
-SENSOR_MONITOR_HOST = "localhost"
-SENSOR_MONITOR_HTTP_PORT = 8000
-SENSOR_MONITOR_DATA_URL = f"http://{SENSOR_MONITOR_HOST}:{SENSOR_MONITOR_HTTP_PORT}/data"
-SENSOR_POLL_TIMEOUT_S = 0.2
+# ---------------------------------------------------------------------
+# Trilateration geometry, matching the teammate's mapping.ino:
+# Box A (master) sits at x=0, Box B (slave) sits at x=BASELINE_M, both
+# on the wall. sensor1/sensor2 are Box A's shallow/steep sensors,
+# sensor3/sensor4 are Box B's shallow/steep sensors (relayed over
+# ESP-NOW). Each box's pair is reduced to one range (the closer of the
+# two, whichever is valid), then those two ranges are trilaterated into
+# an actual (x, y) position in the room - no sensor angle needed for
+# the position math itself, only for physical coverage.
+# ---------------------------------------------------------------------
+BASELINE_M = 1.5       # distance between Box A and Box B (the play area width)
+PLAY_AREA_DEPTH_M = 1.4  # how far the play area extends out from the wall
 
-# Both boxes (master + slave) each have one sensor aimed left and one
-# aimed right. sensor1/sensor3 are the two boxes' left-facing sensors,
-# sensor2/sensor4 are the two right-facing ones. Combining each side's
-# pair gives redundant left/right coverage instead of relying on a
-# single sensor per side.
-LEFT_SENSOR_NAMES = ("sensor1", "sensor3")
-RIGHT_SENSOR_NAMES = ("sensor2", "sensor4")
-# Depth bands: near/mid/far rows. The far row starts at 100cm, so anyone
-# standing 1m or further back already reads as the back row.
-DEPTH_ROW_THRESHOLDS_CM = (50.0, 100.0)
+# Depth bands: near/mid/far rows, evenly spread across the play depth.
+DEPTH_ROW_THRESHOLDS_M = (
+    PLAY_AREA_DEPTH_M / 3.0,
+    2.0 * PLAY_AREA_DEPTH_M / 3.0,
+)
+
 SCREEN_MARGIN = 20
 MOLE_MAX_WIDTH = 120
 MOLE_MAX_HEIGHT = 120
@@ -62,11 +59,6 @@ MOLE_MAX_MS = 3000
 MOLE_DEAD_DISPLAY_MS = 700
 HAMMER_WIND_MS = 200
 SCORE_FONT_SIZE = 72
-# How long a player must continuously stay in one menu button's cell
-# before it's confirmed and acted on. This applies only to the menu
-# screens (main menu, difficulty select, demo) - the playable GAME
-# state keeps its own fast HAMMER_WIND_MS hit timing, unchanged.
-MENU_CONFIRM_MS = 3000
 # Game states
 STATE_MAIN_MENU = "MAIN_MENU"
 STATE_SELECT_DIFFICULTY = "SELECT_DIFFICULTY"
@@ -83,27 +75,25 @@ DIFFICULTY_SETTINGS = {
 DEFAULT_DIFFICULTY = "MEDIUM"
 
 
-def extract_distances(packet):
-    """Pull sensor1..sensor4 out of a packet dict (as returned by
-    sensor_monitor.py's /data endpoint) into the same shape
-    parse_udp_packet used to return: only valid, in-range readings,
-    invalid/missing/out-of-range ones simply absent from the dict.
+def parse_udp_packet(data):
+    """Parse a JSON sensor packet sent by the master ESP32 over UDP.
 
-    sensor_monitor.py's own parser already converts negative readings to
-    None rather than dropping them and doesn't apply a max-range cutoff,
-    so that filtering is re-applied here to keep behaviour identical to
-    the old direct-UDP path."""
+    Returns a dict of whichever of sensor1..sensor4 came back as valid,
+    in-range readings. Any subset is accepted; pick_box_range() below
+    handles missing values."""
+    try:
+        packet = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+
     if not isinstance(packet, dict):
         return None
 
     distances = {}
     for name in ("sensor1", "sensor2", "sensor3", "sensor4"):
-        value = packet.get(name)
-        if value is None:
-            continue
         try:
-            value = float(value)
-        except (TypeError, ValueError):
+            value = float(packet[name])
+        except (KeyError, TypeError, ValueError):
             continue
         if 0 < value <= SENSOR_MAX_DISTANCE_CM:
             distances[name] = value
@@ -113,123 +103,92 @@ def extract_distances(packet):
     return distances
 
 
-def combine_left_right(distances):
-    """Combine the two boxes' matching-side sensors into one left and one
-    right reading, taking whichever of each side's two sensors is closer.
-    Returns (left, right); either may be None if neither sensor on that
-    side has a valid reading this frame."""
-    left_candidates = [distances[name] for name in LEFT_SENSOR_NAMES if name in distances]
-    right_candidates = [distances[name] for name in RIGHT_SENSOR_NAMES if name in distances]
-    left = min(left_candidates) if left_candidates else None
-    right = min(right_candidates) if right_candidates else None
-    return left, right
+def pick_box_range(d_shallow, d_steep):
+    """Given a box's two sensor readings (either may be missing/None),
+    return the closer valid one, or None if neither is valid. Ported
+    directly from the teammate's pickBoxRange() in mapping.ino."""
+    candidates = [d for d in (d_shallow, d_steep) if d is not None]
+    return min(candidates) if candidates else None
 
 
-def sensor_fraction_x(left, right):
-    """Blend the combined left/right readings into a continuous 0..1
-    horizontal position. 0.0 = far left, 1.0 = far right, 0.5 = centered."""
-    if left is None and right is None:
+def trilaterate(dA_cm, dB_cm):
+    """Two-circle trilateration from Box A's and Box B's picked ranges.
+    Box A is at (0, 0), Box B is at (BASELINE_M, 0). Returns (x, y) in
+    metres, or None if either range is missing or the circles don't
+    intersect (inconsistent readings this frame). Ported directly from
+    the teammate's mapping.ino."""
+    if dA_cm is None or dB_cm is None:
         return None
-    # Treat a missing reading as "far away" on that side so the position
-    # still leans toward whichever side actually has a reading.
-    left = SENSOR_MAX_DISTANCE_CM if left is None else left
-    right = SENSOR_MAX_DISTANCE_CM if right is None else right
 
-    closeness_left = max(0.0, SENSOR_MAX_DISTANCE_CM - left)
-    closeness_right = max(0.0, SENSOR_MAX_DISTANCE_CM - right)
-    total = closeness_left + closeness_right
-    if total <= 0:
-        return 0.5
-    # Closer on the right pulls the fraction toward 1.0.
-    return closeness_right / total
+    d1 = dA_cm / 100.0  # Box A's range, metres
+    d2 = dB_cm / 100.0  # Box B's range, metres
 
+    # x = (BASELINE^2 + d1^2 - d2^2) / (2 * BASELINE)
+    # From subtracting the two circle equations x^2+y^2=d1^2 and
+    # (x-BASELINE)^2+y^2=d2^2 to eliminate y.
+    x = (BASELINE_M * BASELINE_M + d1 * d1 - d2 * d2) / (2.0 * BASELINE_M)
 
-def sensor_fraction_row(left, right):
-    """Pick a row using whichever side currently has the nearer reading."""
-    candidates = [v for v in (left, right) if v is not None]
-    if not candidates:
-        return 0
-    nearest_distance = min(candidates)
-    return sum(nearest_distance > threshold for threshold in DEPTH_ROW_THRESHOLDS_CM)
+    # y from Box A's circle: y^2 = d1^2 - x^2
+    y_squared = d1 * d1 - x * x
+    if y_squared < 0:
+        return None
+
+    y = math.sqrt(y_squared)  # positive root = in front of the wall
+    return x, y
 
 
-def sensor_cell_from_fraction(fraction_x, row):
-    """Convert a continuous 0..1 horizontal fraction and a row into a 3x3
-    grid cell index, by splitting the width into three equal zones."""
-    column = min(GRID_SIZE - 1, int(fraction_x * GRID_SIZE))
+def position_to_cell(x, y):
+    """Convert a metric (x, y) position into a 3x3 grid cell index."""
+    x_fraction = min(max(x / BASELINE_M, 0.0), 1.0)
+    column = min(GRID_SIZE - 1, int(x_fraction * GRID_SIZE))
+    row = sum(y > threshold for threshold in DEPTH_ROW_THRESHOLDS_M)
+    row = min(GRID_SIZE - 1, row)
     return row * GRID_SIZE + column
 
 
-class SensorMonitorReader:
-    """Polls sensor_monitor.py's HTTP /data endpoint for the latest
-    packet from each ESP32 board, instead of binding its own UDP socket.
+class UdpDistanceReader:
+    """Reads sensor packets sent by the master ESP32 over the phone hotspot."""
 
-    sensor_monitor.py is the single process that owns UDP port 4210 -
-    this and sensor_monitor.py's own dashboard can now run at the same
-    time without splitting incoming packets between two competing
-    sockets bound to the same port."""
-
-    def __init__(self, url=SENSOR_MONITOR_DATA_URL, timeout=SENSOR_POLL_TIMEOUT_S):
-        self.url = url
-        self.timeout = timeout
-        self._last_seen_at = {}  # mac -> received_at, to detect new packets
+    def __init__(self, port=UDP_PORT):
+        self.port = port
+        self.socket = None
 
     def open(self):
-        # Nothing to bind up front; report whether sensor_monitor.py's
-        # HTTP server is actually reachable right now so callers get the
-        # same "could not open" signal open_udp_reader() used to give.
         try:
-            with urllib.request.urlopen(self.url, timeout=self.timeout):
-                return True
-        except (urllib.error.URLError, OSError):
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.socket.bind(("0.0.0.0", self.port))
+            self.socket.settimeout(0.1)
+            return True
+        except OSError:
+            self.socket = None
             return False
 
     def read_distances(self):
-        """Return the distances dict for whichever board has the most
-        recently updated packet, or None if nothing new is available.
-        Mirrors UdpDistanceReader.read_distances()'s "None means no new
-        frame this call" contract."""
+        if self.socket is None:
+            return None
+
         try:
-            with urllib.request.urlopen(self.url, timeout=self.timeout) as response:
-                packets = json.loads(response.read().decode("utf-8"))
-        except (urllib.error.URLError, OSError, json.JSONDecodeError):
+            data, _address = self.socket.recvfrom(512)
+        except socket.timeout:
+            return None
+        except OSError:
+            self.close()
             return None
 
-        if not isinstance(packets, dict) or not packets:
-            return None
-
-        newest_mac = None
-        newest_packet = None
-        newest_time = None
-        for mac, packet in packets.items():
-            received_at = packet.get("received_at")
-            if received_at is None:
-                continue
-            if newest_time is None or received_at > newest_time:
-                newest_time = received_at
-                newest_mac = mac
-                newest_packet = packet
-
-        if newest_packet is None:
-            return None
-
-        # Only treat it as a fresh frame if this packet is newer than the
-        # last one we already returned for this board - otherwise the
-        # game would keep re-processing the same stale reading every
-        # poll, which the old UDP path never did (each recvfrom() was a
-        # genuinely new packet).
-        if self._last_seen_at.get(newest_mac) == newest_time:
-            return None
-        self._last_seen_at[newest_mac] = newest_time
-
-        return extract_distances(newest_packet)
+        return parse_udp_packet(data)
 
     def close(self):
-        pass
+        if self.socket is not None:
+            try:
+                self.socket.close()
+            except Exception:
+                pass
+            self.socket = None
 
 
-def open_sensor_reader(url=SENSOR_MONITOR_DATA_URL):
-    reader = SensorMonitorReader(url=url)
+def open_udp_reader(port=UDP_PORT):
+    reader = UdpDistanceReader(port=port)
 
     if reader.open():
         return reader
@@ -348,52 +307,6 @@ def draw_image_in_cell(screen, image, grid_start_x, grid_start_y, cell_size, cel
     screen.blit(image, (cx - image.get_width() // 2, cy - image.get_height() // 2))
 
 
-def get_menu_hot_cells(state):
-    """Return the set of grid cell indices that are actionable buttons for
-    the given menu screen. These are the only cells that accumulate dwell
-    time toward a confirmed selection. GAME is not a menu screen - it uses
-    its own instant hammer wind-up/hit logic instead, unaffected by this."""
-    if state == STATE_MAIN_MENU:
-        return {3, 4}
-    if state == STATE_SELECT_DIFFICULTY:
-        return {1, 3, 5, 7}
-    if state == STATE_DEMO:
-        return {8}
-    return set()
-
-
-def draw_dwell_progress_bar(
-    screen, label_font, grid_start_x, grid_start_y, cell_size, cell_index, progress
-):
-    """Draw a horizontal progress bar near the bottom of a grid cell,
-    filling left-to-right as `progress` (0.0-1.0) increases. Used as the
-    visual countdown while a menu selection is being confirmed."""
-    col = cell_index % GRID_SIZE
-    row = cell_index // GRID_SIZE
-    bar_margin = max(6, int(cell_size * 0.08))
-    bar_height = max(8, int(cell_size * 0.09))
-    bar_x = int(grid_start_x + col * cell_size + bar_margin)
-    bar_y = int(grid_start_y + (row + 1) * cell_size - bar_margin - bar_height)
-    bar_width = int(cell_size - 2 * bar_margin)
-
-    progress = max(0.0, min(1.0, progress))
-    track_color = (70, 70, 70)
-    fill_color = (60, 200, 90)
-    border_color = (0, 0, 0)
-
-    pygame.draw.rect(screen, track_color, (bar_x, bar_y, bar_width, bar_height))
-    fill_width = int(bar_width * progress)
-    if fill_width > 0:
-        pygame.draw.rect(screen, fill_color, (bar_x, bar_y, fill_width, bar_height))
-    pygame.draw.rect(screen, border_color, (bar_x, bar_y, bar_width, bar_height), 2)
-
-    remaining_seconds = max(0.0, MENU_CONFIRM_MS * (1.0 - progress) / 1000.0)
-    countdown = label_font.render(f"Confirming: {remaining_seconds:.1f}s", True, border_color)
-    countdown_x = bar_x + (bar_width - countdown.get_width()) // 2
-    countdown_y = bar_y - countdown.get_height() - 3
-    screen.blit(countdown, (countdown_x, countdown_y))
-
-
 # =============================================================================
 # MAIN GAME LOOP
 # =============================================================================
@@ -502,13 +415,7 @@ def main():
     # SCREEN STATE
     # ==========================================================================
     state = STATE_MAIN_MENU
-    # Dwell-to-confirm state for menu screens: which cell (if any) is
-    # currently being held on, and when that hold began. A menu selection
-    # only fires once the player has stayed on the same hot cell for
-    # MENU_CONFIRM_MS continuously - see the MENU DWELL-TO-CONFIRM region
-    # below. This does not apply to STATE_GAME.
-    menu_dwell_cell = None
-    menu_dwell_start = 0
+    prev_mouse_cell = None
 
     hammer_pressed = False
     hammer_press_start = 0
@@ -516,14 +423,11 @@ def main():
     hammer_winding = False
     hammer_wind_start = 0
 
-    reader = open_sensor_reader()
+    reader = open_udp_reader()
     if reader is not None:
-        print(f"Reading sensor data from sensor_monitor.py at {SENSOR_MONITOR_DATA_URL}")
+        print(f"Listening for sensor packets on UDP port {reader.port}")
     else:
-        print(
-            f"Could not reach sensor_monitor.py at {SENSOR_MONITOR_DATA_URL}. "
-            "Make sure sensor_monitor.py is running (with its HTTP dashboard enabled)."
-        )
+        print("Could not open UDP socket for sensor input.")
 
     clock = pygame.time.Clock()
     running = True
@@ -545,18 +449,22 @@ def main():
             mouse_focused = False
             mouse_pos = (0, 0)
 
-        # Combine both boxes' sensors into a cell index - both column
-        # and row snap fully to the 3x3 grid, no smoothing.
+        # Trilaterate an actual (x, y) position from both boxes' ranges,
+        # then snap it to the 3x3 grid - no smoothing.
         if reader is not None:
             distances = reader.read_distances()
             if distances is not None:
-                left, right = combine_left_right(distances)
-                fraction_x = sensor_fraction_x(left, right)
-                if fraction_x is not None:
-                    row = sensor_fraction_row(left, right)
-                    sensor_cell = sensor_cell_from_fraction(fraction_x, row)
+                dA = pick_box_range(distances.get("sensor1"), distances.get("sensor2"))
+                dB = pick_box_range(distances.get("sensor3"), distances.get("sensor4"))
+                position = trilaterate(dA, dB)
+                if position is not None:
+                    x, y = position
+                    sensor_cell = position_to_cell(x, y)
                     sensor_last_update = pygame.time.get_ticks()
-                    print(f"Sensor position: cell={sensor_cell} (left={left}, right={right})")
+                    print(
+                        f"Sensor position: cell={sensor_cell} "
+                        f"(x={x:.2f}m, y={y:.2f}m, dA={dA}, dB={dB})"
+                    )
 
         # Sensor input takes priority when a complete frame is available.
         mx, my = mouse_pos
@@ -589,56 +497,32 @@ def main():
 
         # endregion
 
-        # region MENU DWELL-TO-CONFIRM
-        # Menu screens (main menu, difficulty select, demo) require the
-        # player to stay on a button's cell continuously for
-        # MENU_CONFIRM_MS before it's confirmed, instead of firing the
-        # instant the cell is entered. This avoids accidental selections
-        # from someone just passing through a cell. STATE_GAME is
-        # deliberately excluded - it keeps its own fast HAMMER_WIND_MS
-        # hit timing further down, untouched by any of this.
-        menu_hot_cells = get_menu_hot_cells(state)
-        menu_confirmed_cell = None
-        if menu_hot_cells and mouse_cell in menu_hot_cells:
-            if mouse_cell != menu_dwell_cell:
-                menu_dwell_cell = mouse_cell
-                menu_dwell_start = now
-            elif now - menu_dwell_start >= MENU_CONFIRM_MS:
-                menu_confirmed_cell = mouse_cell
-                # Reset immediately so a held cell doesn't re-fire every
-                # subsequent frame; the resulting state/screen change
-                # naturally starts a fresh dwell for whatever comes next.
-                menu_dwell_cell = None
-                menu_dwell_start = now
-        else:
-            menu_dwell_cell = None
-            menu_dwell_start = now
-        # endregion
-
 
         # region SCREEN 1 - MAIN MENU
         # Handles navigation from the main menu only.
         # Start -> Difficulty Selection
         # Demo  -> Demo Screen
         if state == STATE_MAIN_MENU:
-            if menu_confirmed_cell == 4:
-                # Play the hammer hit animation when confirming a menu option.
-                hammer_pressed = True
-                hammer_press_start = now
-                state = STATE_SELECT_DIFFICULTY
-                print("Entered Select Difficulty screen")
-            elif menu_confirmed_cell == 3:
-                # Play the hammer hit animation when confirming a menu option.
-                hammer_pressed = True
-                hammer_press_start = now
-                state = STATE_DEMO
-                demo_active = True
-                demo_next_action = now + 600
-                # place demo mole
-                mole_cell_index = random.randint(0, GRID_SIZE * GRID_SIZE - 1)
-                mole_state = "alive"
-                mole_expire_time = now + 800
-                print("Entered Demo screen")
+            # Navigate to Select Difficulty (square 4) or Help/Demo (square 3) on enter
+            if mouse_cell != prev_mouse_cell and mouse_cell is not None:
+                if mouse_cell == 4:
+                    # Play the hammer hit animation when selecting a menu option.
+                    hammer_pressed = True
+                    hammer_press_start = now
+                    state = STATE_SELECT_DIFFICULTY
+                    print("Entered Select Difficulty screen")
+                elif mouse_cell == 3:
+                    # Play the hammer hit animation when selecting a menu option.
+                    hammer_pressed = True
+                    hammer_press_start = now
+                    state = STATE_DEMO
+                    demo_active = True
+                    demo_next_action = now + 600
+                    # place demo mole
+                    mole_cell_index = random.randint(0, GRID_SIZE * GRID_SIZE - 1)
+                    mole_state = "alive"
+                    mole_expire_time = now + 800
+                    print("Entered Demo screen")
 
 
         # endregion
@@ -646,35 +530,35 @@ def main():
         # region SCREEN 2 - DIFFICULTY SELECTION
         # Handles choosing EASY, MEDIUM or HARD.
         if state == STATE_SELECT_DIFFICULTY:
-            # Confirm a difficulty on dwelling in grid squares 1,3,5, or
-            # go back to the main menu on dwelling in square 7.
-            if menu_confirmed_cell == 7:
-                hammer_pressed = True
-                hammer_press_start = now
-                state = STATE_MAIN_MENU
-                print("Returned to main menu")
-            elif menu_confirmed_cell == 1:
-                selected = "HARD"
-            elif menu_confirmed_cell == 3:
-                selected = "EASY"
-            elif menu_confirmed_cell == 5:
-                selected = "MEDIUM"
-            else:
-                selected = None
+            # Select difficulty on entering grid squares 1,3,5
+            if mouse_cell != prev_mouse_cell and mouse_cell is not None:
+                if mouse_cell == 7:
+                    hammer_pressed = True
+                    hammer_press_start = now
+                    state = STATE_MAIN_MENU
+                    print("Returned to main menu")
+                elif mouse_cell == 1:
+                    selected = "HARD"
+                elif mouse_cell == 3:
+                    selected = "EASY"
+                elif mouse_cell == 5:
+                    selected = "MEDIUM"
+                else:
+                    selected = None
 
-            if menu_confirmed_cell != 7 and selected is not None:
-                # Play the hammer hit animation when confirming a difficulty.
-                hammer_pressed = True
-                hammer_press_start = now
-                current_difficulty = selected
-                MOLE_MIN_CURRENT, MOLE_MAX_CURRENT = DIFFICULTY_SETTINGS[current_difficulty]
-                score = 0
-                mole_cell_index = random.randint(0, GRID_SIZE * GRID_SIZE - 1)
-                mole_state = "alive"
-                now = pygame.time.get_ticks()
-                mole_expire_time = now + random.randint(MOLE_MIN_CURRENT, MOLE_MAX_CURRENT)
-                state = STATE_GAME
-                print(f"Difficulty {current_difficulty} selected; starting game")
+                if selected is not None:
+                    # Play the hammer hit animation when selecting a difficulty.
+                    hammer_pressed = True
+                    hammer_press_start = now
+                    current_difficulty = selected
+                    MOLE_MIN_CURRENT, MOLE_MAX_CURRENT = DIFFICULTY_SETTINGS[current_difficulty]
+                    score = 0
+                    mole_cell_index = random.randint(0, GRID_SIZE * GRID_SIZE - 1)
+                    mole_state = "alive"
+                    now = pygame.time.get_ticks()
+                    mole_expire_time = now + random.randint(MOLE_MIN_CURRENT, MOLE_MAX_CURRENT)
+                    state = STATE_GAME
+                    print(f"Difficulty {current_difficulty} selected; starting game")
 
 
         # endregion
@@ -683,7 +567,7 @@ def main():
         
         # Will need to include demo on how it works
 
-        if state == STATE_DEMO and menu_confirmed_cell == 8:
+        if state == STATE_DEMO and mouse_cell != prev_mouse_cell and mouse_cell == 8:
             hammer_pressed = True
             hammer_press_start = now
             state = STATE_MAIN_MENU
@@ -695,8 +579,6 @@ def main():
 
         # region SCREEN 4 - GAME SCREEN
         # Handles the playable game: hammer movement, hits and scoring.
-        # Deliberately NOT using the menu dwell-to-confirm logic above -
-        # hits stay on the original fast HAMMER_WIND_MS timing.
         if state == STATE_GAME:
             # Wind-up logic: start wind-up when mouse enters mole's cell
             if mouse_cell == mole_cell_index and mole_state == "alive" and not hammer_winding and not hammer_pressed:
@@ -798,25 +680,6 @@ def main():
 
         # endregion
 
-        # region RENDERING - MENU DWELL PROGRESS BAR
-        # Shows the 3-second confirmation countdown for whichever menu
-        # button is currently being held on. Only drawn on menu screens -
-        # menu_dwell_cell is always None while in STATE_GAME because the
-        # dwell-to-confirm region above only tracks cells in
-        # get_menu_hot_cells(state), which returns an empty set for GAME.
-        if menu_dwell_cell is not None:
-            dwell_progress = (now - menu_dwell_start) / MENU_CONFIRM_MS
-            draw_dwell_progress_bar(
-                screen,
-                label_font,
-                grid_start_x,
-                grid_start_y,
-                cell_size,
-                menu_dwell_cell,
-                dwell_progress,
-            )
-        # endregion
-
         # region RENDERING - GAME
         # Draw mole depending on state
         if state in (STATE_GAME):
@@ -872,6 +735,9 @@ def main():
             pygame.mouse.set_visible(True)
         # endregion
 
+        # update previous mouse cell for edge-trigger detection
+        prev_mouse_cell = mouse_cell
+
         pygame.display.flip()
         clock.tick(60)
 
@@ -882,4 +748,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main() 
+    main()
