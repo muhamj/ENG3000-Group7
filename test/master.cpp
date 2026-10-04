@@ -12,7 +12,8 @@
 //      all four readings live, with no laptop script required.
 //
 // Flash espnow_slave-matching slave.cpp to the OTHER board, with its
-// MASTER_MAC set to whatever this board prints as its own MAC below.
+// MASTER_MAC set to this board's SoftAP MAC below. The SoftAP MAC is the
+// destination because ESP-NOW is registered on WIFI_IF_AP here.
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -68,6 +69,9 @@ const int SENSOR_1_ECHO_PIN = 35;
 const int SENSOR_2_TRIG_PIN = 12;
 const int SENSOR_2_ECHO_PIN = 14;
 const int LED_PIN = 2;
+const unsigned long SENSOR_SETTLE_DELAY_MS = 60;
+const float MAX_TRACKING_DISTANCE_CM = 200.0f;
+const float POSITION_SMOOTHING_ALPHA = 0.35f;
 
 WiFiUDP udp;
 WebServer webServer(80);
@@ -90,10 +94,14 @@ float readSensorDistance(int trigPin, int echoPin) {
   return duration * 0.0343f / 2.0f;
 }
 
+bool isValidDistance(float distance) {
+  return isfinite(distance) && distance > 0.0f && distance <= MAX_TRACKING_DISTANCE_CM;
+}
+
 float getClosestValidDistance(float a, float b) {
-  if (a < 0 && b < 0) return -1.0f;
-  if (a < 0) return b;
-  if (b < 0) return a;
+  if (!isValidDistance(a) && !isValidDistance(b)) return -1.0f;
+  if (!isValidDistance(a)) return b;
+  if (!isValidDistance(b)) return a;
   return a < b ? a : b;
 }
 
@@ -104,6 +112,61 @@ void printDistanceValue(float distance) {
     Serial.print(distance, 2);
     Serial.print(" cm");
   }
+}
+
+struct PlayerPosition {
+  bool valid;
+  float x;
+  float y;
+};
+
+float closestValid(float a, float b) {
+  return getClosestValidDistance(a, b);
+}
+
+PlayerPosition calculatePlayerPosition(
+  float sensor1,
+  float sensor2,
+  float sensor3,
+  float sensor4
+) {
+  static bool hasSmoothedPosition = false;
+  static float smoothedX = 0.5f;
+  static float smoothedY = 0.5f;
+
+  float leftTotal = 0.0f;
+  float rightTotal = 0.0f;
+  int leftCount = 0;
+  int rightCount = 0;
+
+  if (isValidDistance(sensor1)) { leftTotal += sensor1; leftCount++; }
+  if (isValidDistance(sensor3)) { leftTotal += sensor3; leftCount++; }
+  if (isValidDistance(sensor2)) { rightTotal += sensor2; rightCount++; }
+  if (isValidDistance(sensor4)) { rightTotal += sensor4; rightCount++; }
+
+  if (leftCount == 0 && rightCount == 0) {
+    hasSmoothedPosition = false;
+    return {false, -1.0f, -1.0f};
+  }
+
+  float leftDistance = leftCount == 0 ? MAX_TRACKING_DISTANCE_CM : leftTotal / leftCount;
+  float rightDistance = rightCount == 0 ? MAX_TRACKING_DISTANCE_CM : rightTotal / rightCount;
+  float leftCloseness = MAX_TRACKING_DISTANCE_CM - leftDistance;
+  float rightCloseness = MAX_TRACKING_DISTANCE_CM - rightDistance;
+  float totalCloseness = leftCloseness + rightCloseness;
+  float x = totalCloseness <= 0 ? 0.5f : rightCloseness / totalCloseness;
+
+  float nearestDistance = closestValid(leftDistance, rightDistance);
+  float y = 1.0f - nearestDistance / MAX_TRACKING_DISTANCE_CM;
+  if (!hasSmoothedPosition) {
+    smoothedX = x;
+    smoothedY = y;
+    hasSmoothedPosition = true;
+  } else {
+    smoothedX += POSITION_SMOOTHING_ALPHA * (x - smoothedX);
+    smoothedY += POSITION_SMOOTHING_ALPHA * (y - smoothedY);
+  }
+  return {true, smoothedX, smoothedY};
 }
 
 // =======================================================================
@@ -136,7 +199,7 @@ void onDataReceived(const uint8_t *, const uint8_t *incomingData, int length) {
 
 void buildSensorJson(char *buffer, size_t bufferSize) {
   float sensor1 = readSensorDistance(SENSOR_1_TRIG_PIN, SENSOR_1_ECHO_PIN);
-  delay(60); // let sensor 1's pulse die down before firing sensor 2
+  delay(SENSOR_SETTLE_DELAY_MS); // let sensor 1's echo die down before sensor 2
   float sensor2 = readSensorDistance(SENSOR_2_TRIG_PIN, SENSOR_2_ECHO_PIN);
 
   float remote1 = slaveSensor1Cm;
@@ -150,17 +213,20 @@ void buildSensorJson(char *buffer, size_t bufferSize) {
     getClosestValidDistance(sensor1, sensor2),
     getClosestValidDistance(remote1, remote2)
   );
+  PlayerPosition position = calculatePlayerPosition(sensor1, sensor2, remote1, remote2);
 
   snprintf(
     buffer,
     bufferSize,
-    "{\"mac\":\"%s\",\"sensor1\":%.2f,\"sensor2\":%.2f,\"sensor3\":%.2f,\"sensor4\":%.2f,\"closest\":%.2f}",
+    "{\"mac\":\"%s\",\"sensor1\":%.2f,\"sensor2\":%.2f,\"sensor3\":%.2f,\"sensor4\":%.2f,\"closest\":%.2f,\"x\":%.3f,\"y\":%.3f}",
     WiFi.macAddress().c_str(),
     sensor1,
     sensor2,
     remote1,
     remote2,
-    closest
+    closest,
+    position.x,
+    position.y
   );
 
   Serial.print("distance: ");
@@ -174,7 +240,11 @@ void buildSensorJson(char *buffer, size_t bufferSize) {
   Serial.print(" | sensor 4 (slave 2): ");
   printDistanceValue(remote2);
   Serial.print(" | ms since last slave packet: ");
-  Serial.println(millis() - lastSlavePacketMs);
+  Serial.print(millis() - lastSlavePacketMs);
+  Serial.print(" | x: ");
+  if (position.valid) Serial.print(position.x, 3); else Serial.print("NaN");
+  Serial.print(" | y: ");
+  if (position.valid) Serial.println(position.y, 3); else Serial.println("NaN");
 }
 
 // =======================================================================
@@ -199,9 +269,9 @@ const char DASHBOARD_HTML[] PROGMEM = R"HTML(
   h1 { font-size: 18px; margin: 0 0 16px 0; }
   .grid {
     display: grid;
-    grid-template-columns: repeat(2, 1fr);
+    grid-template-columns: repeat(3, 1fr);
     gap: 14px;
-    max-width: 480px;
+    max-width: 620px;
   }
   .box {
     background: #1a1a1a;
@@ -226,6 +296,15 @@ const char DASHBOARD_HTML[] PROGMEM = R"HTML(
     color: #888;
     font-size: 12px;
   }
+  .position-map {
+    margin-top: 18px;
+    width: min(100%, 620px);
+    background: #1a1a1a;
+    border: 1px solid #333;
+    border-radius: 10px;
+    padding: 12px;
+  }
+  canvas { display: block; width: 100%; height: auto; background: #101820; }
 </style>
 </head>
 <body>
@@ -235,11 +314,35 @@ const char DASHBOARD_HTML[] PROGMEM = R"HTML(
     <div class="box"><div class="box-label">Sensor 2</div><div class="box-value" id="s2">--</div></div>
     <div class="box"><div class="box-label">Sensor 3</div><div class="box-value" id="s3">--</div></div>
     <div class="box"><div class="box-label">Sensor 4</div><div class="box-value" id="s4">--</div></div>
+    <div class="box"><div class="box-label">X coordinate</div><div class="box-value" id="x">--</div></div>
+    <div class="box"><div class="box-label">Y coordinate</div><div class="box-value" id="y">--</div></div>
   </div>
+  <div class="position-map"><canvas id="positionMap" width="600" height="360"></canvas></div>
   <div class="status" id="status">Loading...</div>
   <script>
     function fmt(v) {
       return (v === null || v < 0) ? "--" : v.toFixed(1) + " cm";
+    }
+    function fmtCoordinate(v) {
+      return (v === null || v < 0) ? "--" : v.toFixed(3);
+    }
+    function drawPosition(x, y) {
+      const canvas = document.getElementById("positionMap");
+      const ctx = canvas.getContext("2d");
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.strokeStyle = "#425466";
+      ctx.lineWidth = 2;
+      for (let i = 1; i < 3; i++) {
+        ctx.beginPath(); ctx.moveTo(canvas.width * i / 3, 0);
+        ctx.lineTo(canvas.width * i / 3, canvas.height); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(0, canvas.height * i / 3);
+        ctx.lineTo(canvas.width, canvas.height * i / 3); ctx.stroke();
+      }
+      if (x === null || y === null || x < 0 || y < 0) return;
+      ctx.fillStyle = "#ffcc33";
+      ctx.beginPath();
+      ctx.arc(x * canvas.width, y * canvas.height, 12, 0, Math.PI * 2);
+      ctx.fill();
     }
     async function poll() {
       try {
@@ -249,6 +352,9 @@ const char DASHBOARD_HTML[] PROGMEM = R"HTML(
         document.getElementById("s2").textContent = fmt(d.sensor2);
         document.getElementById("s3").textContent = fmt(d.sensor3);
         document.getElementById("s4").textContent = fmt(d.sensor4);
+        document.getElementById("x").textContent = fmtCoordinate(d.x);
+        document.getElementById("y").textContent = fmtCoordinate(d.y);
+        drawPosition(d.x, d.y);
         document.getElementById("status").textContent =
           "Updated " + new Date().toLocaleTimeString();
       } catch (e) {
@@ -300,6 +406,8 @@ void setup() {
   Serial.println("Sensor 2: TRIG=12, ECHO=14");
   Serial.print("Master MAC Address: ");
   Serial.println(WiFi.macAddress());
+  Serial.print("Master SoftAP MAC (copy this into slave.cpp): ");
+  Serial.println(WiFi.softAPmacAddress());
   Serial.print("Wi-Fi network name: ");
   Serial.println(AP_SSID);
   Serial.print("Wi-Fi password: ");

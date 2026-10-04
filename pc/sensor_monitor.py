@@ -27,6 +27,13 @@ def parse_packet(data):
 				packet[key] = None
 			else:
 				packet[key] = value
+		for key in ("x", "y"):
+			try:
+				value = float(packet[key])
+			except (KeyError, TypeError, ValueError):
+				packet[key] = None
+			else:
+				packet[key] = value if 0.0 <= value <= 1.0 else None
 		return packet
 	except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError):
 		return None

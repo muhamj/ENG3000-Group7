@@ -160,6 +160,21 @@
   .conn-error {
     color: #ef5350;
   }
+
+  .position-map {
+    background: #141924;
+    border: 1px solid #232a3b;
+    border-radius: 12px;
+    padding: 16px;
+    margin-bottom: 28px;
+  }
+
+  canvas {
+    display: block;
+    width: 100%;
+    max-height: 420px;
+    background: #0b0e14;
+  }
 </style>
 </head>
 <body>
@@ -172,6 +187,9 @@
     <div class="cards" id="cards">
       <div class="empty-state">Waiting for packets from the ESP32 boards...</div>
     </div>
+    <div class="position-map">
+      <canvas id="positionMap" width="900" height="500"></canvas>
+    </div>
   </div>
 
   <script>
@@ -183,6 +201,30 @@
       return value === null || value === undefined
         ? '<span class="sensor-value empty">--</span>'
         : `<span class="sensor-value">${value.toFixed(1)}</span>`;
+    }
+
+    function drawPositions(packets) {
+      const canvas = document.getElementById("positionMap");
+      const ctx = canvas.getContext("2d");
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.strokeStyle = "#425466";
+      ctx.lineWidth = 2;
+      for (let i = 1; i < 3; i++) {
+        ctx.beginPath(); ctx.moveTo(canvas.width * i / 3, 0);
+        ctx.lineTo(canvas.width * i / 3, canvas.height); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(0, canvas.height * i / 3);
+        ctx.lineTo(canvas.width, canvas.height * i / 3); ctx.stroke();
+      }
+      const macs = Object.keys(packets).sort();
+      macs.forEach((mac, index) => {
+        const p = packets[mac];
+        if (p.x === null || p.y === null || p.x === undefined || p.y === undefined) return;
+        const colors = ["#ffcc33", "#4cd97b", "#ef5350", "#65b6ff"];
+        ctx.fillStyle = colors[index % colors.length];
+        ctx.beginPath();
+        ctx.arc(p.x * canvas.width, p.y * canvas.height, 13, 0, Math.PI * 2);
+        ctx.fill();
+      });
     }
 
     function render(packets) {
@@ -232,6 +274,14 @@
               <div class="sensor-label">S4</div>
               ${formatDistance(p.sensor4)}
             </div>
+            <div class="sensor">
+              <div class="sensor-label">X</div>
+              ${formatDistance(p.x)}
+            </div>
+            <div class="sensor">
+              <div class="sensor-label">Y</div>
+              ${formatDistance(p.y)}
+            </div>
           </div>
         </div>`;
       }).join("");
@@ -242,6 +292,7 @@
         const response = await fetch(DATA_URL, { cache: "no-store" });
         const packets = await response.json();
         render(packets);
+        drawPositions(packets);
         document.getElementById("updated").textContent =
           "Updated " + new Date().toLocaleTimeString();
         document.getElementById("updated").classList.remove("conn-error");

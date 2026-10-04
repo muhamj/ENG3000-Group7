@@ -14,10 +14,10 @@
 #include <esp_wifi.h>
 #include <esp_arduino_version.h>
 
-// Physical MAC address of the master board (burned into its hardware,
-// doesn't change with firmware). Update if you swap which physical
-// board is the master.
-const uint8_t MASTER_MAC[] = {0x90, 0x15, 0x06, 0x73, 0x70, 0x40};
+// MAC address of the master's SoftAP interface. This is different from
+// the master's STA MAC when it runs in WIFI_AP_STA mode. Copy the value
+// printed as "Master SoftAP MAC" by master.cpp.
+const uint8_t MASTER_MAC[] = {0x00, 0x70, 0x07, 0x7C, 0x72, 0xA5};
 
 // Must match FIXED_CHANNEL in master.cpp exactly. Since the master hosts
 // its own Wi-Fi network instead of joining a phone hotspot, this value
@@ -29,6 +29,7 @@ const int SENSOR_1_ECHO_PIN = 35;
 const int SENSOR_2_TRIG_PIN = 12;
 const int SENSOR_2_ECHO_PIN = 14;
 const int LED_PIN = 2;
+const unsigned long SENSOR_SETTLE_DELAY_MS = 60;
 
 struct SensorPacket {
   float sensor1Cm;
@@ -119,7 +120,7 @@ void setup() {
 void loop() {
   SensorPacket packet;
   packet.sensor1Cm = readSensorDistance(SENSOR_1_TRIG_PIN, SENSOR_1_ECHO_PIN);
-  delay(60);
+  delay(SENSOR_SETTLE_DELAY_MS); // let sensor 1's echo die down before sensor 2
   packet.sensor2Cm = readSensorDistance(SENSOR_2_TRIG_PIN, SENSOR_2_ECHO_PIN);
   esp_now_send(MASTER_MAC, reinterpret_cast<uint8_t *>(&packet), sizeof(packet));
   delay(100);
