@@ -40,13 +40,12 @@ UDP_PORT = 4210
 # the position math itself, only for physical coverage.
 # ---------------------------------------------------------------------
 BASELINE_M = 1.5       # distance between Box A and Box B (the play area width)
-PLAY_AREA_DEPTH_M = 1.4  # how far the play area extends out from the wall
-
-# Depth bands: near/mid/far rows, evenly spread across the play depth.
-DEPTH_ROW_THRESHOLDS_M = (
-    PLAY_AREA_DEPTH_M / 3.0,
-    2.0 * PLAY_AREA_DEPTH_M / 3.0,
-)
+DEAD_ZONE_DEPTH_M = 0.6
+ROW_1_END_DEPTH_M = 1.0
+ROW_2_END_DEPTH_M = 1.4
+POSITION_MAP_DEPTH_M = 1.8
+LEFT_COLUMN_END_M = BASELINE_M / 2.0 - 0.4
+RIGHT_COLUMN_START_M = BASELINE_M / 2.0 + 0.4
 
 SCREEN_MARGIN = 20
 MOLE_MAX_WIDTH = 120
@@ -139,10 +138,18 @@ def trilaterate(dA_cm, dB_cm):
 
 def position_to_cell(x, y):
     """Convert a metric (x, y) position into a 3x3 grid cell index."""
-    x_fraction = min(max(x / BASELINE_M, 0.0), 1.0)
-    column = min(GRID_SIZE - 1, int(x_fraction * GRID_SIZE))
-    row = sum(y > threshold for threshold in DEPTH_ROW_THRESHOLDS_M)
-    row = min(GRID_SIZE - 1, row)
+    if y <= DEAD_ZONE_DEPTH_M or y > POSITION_MAP_DEPTH_M:
+        return None
+
+    if x <= LEFT_COLUMN_END_M:
+        column = 0
+    elif x >= RIGHT_COLUMN_START_M:
+        column = 2
+    else:
+        column = 1
+
+    near_to_far_row = 0 if y < ROW_1_END_DEPTH_M else 1 if y < ROW_2_END_DEPTH_M else 2
+    row = GRID_SIZE - 1 - near_to_far_row
     return row * GRID_SIZE + column
 
 

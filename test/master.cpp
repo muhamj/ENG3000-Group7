@@ -11,9 +11,8 @@
 //   5. Serves its own built-in web page at http://192.168.4.1/ showing
 //      all four readings live, with no laptop script required.
 //
-// Flash espnow_slave-matching slave.cpp to the OTHER board, with its
-// MASTER_MAC set to this board's SoftAP MAC below. The SoftAP MAC is the
-// destination because ESP-NOW is registered on WIFI_IF_AP here.
+// Flash the matching slave.cpp to the other board. Both boards use the
+// fixed channel and ESP-NOW broadcast, so no MAC address pairing is needed.
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -44,13 +43,8 @@ const unsigned int UDP_PORT = 4210;
 // or kept up to date - whoever is listening on UDP_PORT gets it.
 IPAddress BROADCAST_IP(192, 168, 4, 255);
 
-// ---------------------------------------------------------------------
-// ESP-NOW: receiving the slave's two sensor readings
-// ---------------------------------------------------------------------
-// Physical MAC address of the slave board (burned into its hardware,
-// doesn't change with firmware). Update if you swap which physical
-// board is the slave.
-const uint8_t SLAVE_MAC[] = {0x00, 0x70, 0x07, 0x7C, 0x72, 0xA4};
+// ESP-NOW broadcast reaches the slave without relying on a hard-coded MAC.
+const uint8_t ESPNOW_BROADCAST_MAC[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 struct SensorPacket {
   float sensor1Cm;
@@ -60,6 +54,8 @@ struct SensorPacket {
 volatile float slaveSensor1Cm = -1.0f;
 volatile float slaveSensor2Cm = -1.0f;
 volatile unsigned long lastSlavePacketMs = 0;
+volatile bool slaveReplyReady = false;
+const uint8_t SLAVE_SAMPLE_REQUEST = 2;
 
 // ---------------------------------------------------------------------
 // Master's own two ultrasonic sensors
@@ -69,9 +65,18 @@ const int SENSOR_1_ECHO_PIN = 35;
 const int SENSOR_2_TRIG_PIN = 12;
 const int SENSOR_2_ECHO_PIN = 14;
 const int LED_PIN = 2;
-const unsigned long SENSOR_SETTLE_DELAY_MS = 60;
+const int BUZZER_PIN = 18;
+const unsigned int BUZZER_FREQUENCY_HZ = 2200;
+const unsigned long SENSOR_SETTLE_DELAY_MS = 40;
 const float MAX_TRACKING_DISTANCE_CM = 200.0f;
-const float POSITION_SMOOTHING_ALPHA = 0.35f;
+const float BOX_BASELINE_M = 1.5f;
+ const float POSITION_X_MARGIN_M = 0.35f;
+const float DEAD_ZONE_DEPTH_M = 0.5f;
+const float DEAD_ZONE_RELEASE_DEPTH_M = 0.55f;
+const float POSITION_MAP_DEPTH_M = 1.8f;
+const size_t POSITION_HISTORY_SIZE = 3;
+const float POSITION_SMOOTHING_ALPHA = 0.85f;
+bool playerInDeadZone = false;
 
 WiFiUDP udp;
 WebServer webServer(80);
@@ -87,7 +92,7 @@ float readSensorDistance(int trigPin, int echoPin) {
   delayMicroseconds(10);
   digitalWrite(trigPin, LOW);
 
-  long duration = pulseIn(echoPin, HIGH, 30000);
+  long duration = pulseIn(echoPin, HIGH, 16000);
   if (duration <= 0) {
     return -1.0f;
   }
@@ -120,8 +125,144 @@ struct PlayerPosition {
   float y;
 };
 
-float closestValid(float a, float b) {
-  return getClosestValidDistance(a, b);
+struct PositionFilterState {
+  bool hasPosition;
+  float smoothedX;
+  float smoothedY;
+  float xHistory[POSITION_HISTORY_SIZE];
+  float yHistory[POSITION_HISTORY_SIZE];
+  size_t historyCount;
+  size_t historyIndex;
+};
+
+struct SensorDistanceFilterState {
+  float history[4][POSITION_HISTORY_SIZE];
+  size_t historyCount[4];
+  size_t historyIndex[4];
+};
+
+float medianOf(float *values, int count) {
+  for (int i = 1; i < count; i++) {
+    float value = values[i];
+    int j = i - 1;
+    while (j >= 0 && values[j] > value) {
+      values[j + 1] = values[j];
+      j--;
+    }
+    values[j + 1] = value;
+  }
+  if (count % 2 == 0) {
+    return (values[count / 2 - 1] + values[count / 2]) * 0.5f;
+  }
+  return values[count / 2];
+}
+
+float filterSensorDistance(float distance, size_t sensorIndex, SensorDistanceFilterState &state) {
+  state.history[sensorIndex][state.historyIndex[sensorIndex]] =
+    isValidDistance(distance) ? distance : -1.0f;
+  state.historyIndex[sensorIndex] =
+    (state.historyIndex[sensorIndex] + 1) % POSITION_HISTORY_SIZE;
+  if (state.historyCount[sensorIndex] < POSITION_HISTORY_SIZE) {
+    state.historyCount[sensorIndex]++;
+  }
+
+  if (!isValidDistance(distance)) return -1.0f;
+
+  float samples[POSITION_HISTORY_SIZE];
+  int sampleCount = 0;
+  for (size_t i = 0; i < state.historyCount[sensorIndex]; i++) {
+    float sample = state.history[sensorIndex][i];
+    if (isValidDistance(sample)) samples[sampleCount++] = sample;
+  }
+  return sampleCount < 3 ? distance : medianOf(samples, sampleCount);
+}
+
+struct PositionCandidate {
+  float xMeters;
+  float depthMeters;
+};
+
+bool calculatePositionCandidate(float masterCm, float slaveCm, PositionCandidate &candidate) {
+  if (!isValidDistance(masterCm) || !isValidDistance(slaveCm)) return false;
+
+  float masterRange = masterCm / 100.0f;
+  float slaveRange = slaveCm / 100.0f;
+  float xMeters = (BOX_BASELINE_M * BOX_BASELINE_M + masterRange * masterRange
+    - slaveRange * slaveRange) / (2.0f * BOX_BASELINE_M);
+  float ySquared = masterRange * masterRange - xMeters * xMeters;
+  if (xMeters < -POSITION_X_MARGIN_M ||
+      xMeters > BOX_BASELINE_M + POSITION_X_MARGIN_M || ySquared < -0.04f) return false;
+
+  float depthMeters = sqrtf(ySquared < 0.0f ? 0.0f : ySquared);
+  if (depthMeters > POSITION_MAP_DEPTH_M) return false;
+
+  candidate = {xMeters, depthMeters};
+  return true;
+}
+
+PositionCandidate selectPositionCandidate(
+  PositionCandidate *candidates,
+  size_t candidateCount,
+  const PositionFilterState &state
+) {
+  if (!state.hasPosition) {
+    float xSamples[4];
+    float depthSamples[4];
+    for (size_t i = 0; i < candidateCount; i++) {
+      xSamples[i] = candidates[i].xMeters;
+      depthSamples[i] = candidates[i].depthMeters;
+    }
+    return {
+      medianOf(xSamples, candidateCount),
+      medianOf(depthSamples, candidateCount)
+    };
+  }
+
+  float previousX = state.smoothedX * BOX_BASELINE_M;
+  float previousDepth = (1.0f - state.smoothedY) * POSITION_MAP_DEPTH_M;
+  size_t closestIndex = 0;
+  float closestDistanceSquared = INFINITY;
+  for (size_t i = 0; i < candidateCount; i++) {
+    float deltaX = candidates[i].xMeters - previousX;
+    float deltaDepth = candidates[i].depthMeters - previousDepth;
+    float distanceSquared = deltaX * deltaX + deltaDepth * deltaDepth;
+    if (distanceSquared < closestDistanceSquared) {
+      closestDistanceSquared = distanceSquared;
+      closestIndex = i;
+    }
+  }
+  return candidates[closestIndex];
+}
+
+PlayerPosition retainPosition(const PositionFilterState &state) {
+  return state.hasPosition ? PlayerPosition{true, state.smoothedX, state.smoothedY}
+                           : PlayerPosition{false, -1.0f, -1.0f};
+}
+
+PlayerPosition addPositionSample(float x, float y, PositionFilterState &state) {
+  state.xHistory[state.historyIndex] = x;
+  state.yHistory[state.historyIndex] = y;
+  state.historyIndex = (state.historyIndex + 1) % POSITION_HISTORY_SIZE;
+  if (state.historyCount < POSITION_HISTORY_SIZE) state.historyCount++;
+
+  float xSamples[POSITION_HISTORY_SIZE];
+  float ySamples[POSITION_HISTORY_SIZE];
+  for (size_t i = 0; i < state.historyCount; i++) {
+    xSamples[i] = state.xHistory[i];
+    ySamples[i] = state.yHistory[i];
+  }
+  float measuredX = medianOf(xSamples, state.historyCount);
+  float measuredY = medianOf(ySamples, state.historyCount);
+
+  if (!state.hasPosition) {
+    state.smoothedX = measuredX;
+    state.smoothedY = measuredY;
+    state.hasPosition = true;
+  } else {
+    state.smoothedX += POSITION_SMOOTHING_ALPHA * (measuredX - state.smoothedX);
+    state.smoothedY += POSITION_SMOOTHING_ALPHA * (measuredY - state.smoothedY);
+  }
+  return {true, state.smoothedX, state.smoothedY};
 }
 
 PlayerPosition calculatePlayerPosition(
@@ -130,43 +271,58 @@ PlayerPosition calculatePlayerPosition(
   float sensor3,
   float sensor4
 ) {
-  static bool hasSmoothedPosition = false;
-  static float smoothedX = 0.5f;
-  static float smoothedY = 0.5f;
+  static PositionFilterState filterState = {};
+  static SensorDistanceFilterState distanceFilterState = {};
+  static bool deadZoneLatched = false;
+  playerInDeadZone = false;
 
-  float leftTotal = 0.0f;
-  float rightTotal = 0.0f;
-  int leftCount = 0;
-  int rightCount = 0;
+  float filteredSensor1 = filterSensorDistance(sensor1, 0, distanceFilterState);
+  float filteredSensor2 = filterSensorDistance(sensor2, 1, distanceFilterState);
+  float filteredSensor3 = filterSensorDistance(sensor3, 2, distanceFilterState);
+  float filteredSensor4 = filterSensorDistance(sensor4, 3, distanceFilterState);
 
-  if (isValidDistance(sensor1)) { leftTotal += sensor1; leftCount++; }
-  if (isValidDistance(sensor3)) { leftTotal += sensor3; leftCount++; }
-  if (isValidDistance(sensor2)) { rightTotal += sensor2; rightCount++; }
-  if (isValidDistance(sensor4)) { rightTotal += sensor4; rightCount++; }
-
-  if (leftCount == 0 && rightCount == 0) {
-    hasSmoothedPosition = false;
-    return {false, -1.0f, -1.0f};
+  // Headings are master: -20/-70 degrees and slave: +20/+70 degrees.
+  // Evaluate every cross-box pair so a missing or misleading echo from
+  // one beam cannot distort the range chosen for its entire box.
+  float masterReadings[] = {filteredSensor1, filteredSensor2};
+  float slaveReadings[] = {filteredSensor3, filteredSensor4};
+  PositionCandidate candidates[4];
+  size_t candidateCount = 0;
+  for (float masterReading : masterReadings) {
+    for (float slaveReading : slaveReadings) {
+      PositionCandidate candidate;
+      if (calculatePositionCandidate(masterReading, slaveReading, candidate)) {
+        candidates[candidateCount++] = candidate;
+      }
+    }
   }
+  if (candidateCount == 0) return retainPosition(filterState);
 
-  float leftDistance = leftCount == 0 ? MAX_TRACKING_DISTANCE_CM : leftTotal / leftCount;
-  float rightDistance = rightCount == 0 ? MAX_TRACKING_DISTANCE_CM : rightTotal / rightCount;
-  float leftCloseness = MAX_TRACKING_DISTANCE_CM - leftDistance;
-  float rightCloseness = MAX_TRACKING_DISTANCE_CM - rightDistance;
-  float totalCloseness = leftCloseness + rightCloseness;
-  float x = totalCloseness <= 0 ? 0.5f : rightCloseness / totalCloseness;
+  PositionCandidate measured = selectPositionCandidate(candidates, candidateCount, filterState);
+  float xMeters = measured.xMeters;
+  float depthMeters = measured.depthMeters;
 
-  float nearestDistance = closestValid(leftDistance, rightDistance);
-  float y = 1.0f - nearestDistance / MAX_TRACKING_DISTANCE_CM;
-  if (!hasSmoothedPosition) {
-    smoothedX = x;
-    smoothedY = y;
-    hasSmoothedPosition = true;
+  if (deadZoneLatched) {
+    deadZoneLatched = depthMeters <= DEAD_ZONE_RELEASE_DEPTH_M;
   } else {
-    smoothedX += POSITION_SMOOTHING_ALPHA * (x - smoothedX);
-    smoothedY += POSITION_SMOOTHING_ALPHA * (y - smoothedY);
+    deadZoneLatched = depthMeters <= DEAD_ZONE_DEPTH_M;
   }
-  return {true, smoothedX, smoothedY};
+  playerInDeadZone = deadZoneLatched;
+
+  float x = fminf(1.0f, fmaxf(0.0f, xMeters / BOX_BASELINE_M));
+  float y = 1.0f - depthMeters / POSITION_MAP_DEPTH_M;
+  return addPositionSample(x, y, filterState);
+}
+
+void setBuzzerOutput(bool enabled) {
+  static bool outputEnabled = false;
+  if (enabled == outputEnabled) return;
+  if (enabled) {
+    tone(BUZZER_PIN, BUZZER_FREQUENCY_HZ);
+  } else {
+    noTone(BUZZER_PIN);
+  }
+  outputEnabled = enabled;
 }
 
 // =======================================================================
@@ -182,6 +338,7 @@ void handleSlavePacket(const uint8_t *incomingData, int length) {
   slaveSensor1Cm = packet.sensor1Cm;
   slaveSensor2Cm = packet.sensor2Cm;
   lastSlavePacketMs = millis();
+  slaveReplyReady = true;
 }
 
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
@@ -190,6 +347,19 @@ void onDataReceived(const esp_now_recv_info_t *, const uint8_t *incomingData, in
 void onDataReceived(const uint8_t *, const uint8_t *incomingData, int length) {
 #endif
   handleSlavePacket(incomingData, length);
+}
+
+bool requestSlaveSample() {
+  slaveReplyReady = false;
+  uint8_t request = SLAVE_SAMPLE_REQUEST;
+  delay(SENSOR_SETTLE_DELAY_MS);
+  if (esp_now_send(ESPNOW_BROADCAST_MAC, &request, sizeof(request)) != ESP_OK) return false;
+
+  unsigned long requestStartedMs = millis();
+  while (!slaveReplyReady && millis() - requestStartedMs < 250) {
+    delay(1);
+  }
+  return slaveReplyReady;
 }
 
 // =======================================================================
@@ -202,18 +372,18 @@ void buildSensorJson(char *buffer, size_t bufferSize) {
   delay(SENSOR_SETTLE_DELAY_MS); // let sensor 1's echo die down before sensor 2
   float sensor2 = readSensorDistance(SENSOR_2_TRIG_PIN, SENSOR_2_ECHO_PIN);
 
-  float remote1 = slaveSensor1Cm;
-  float remote2 = slaveSensor2Cm;
-  if (millis() - lastSlavePacketMs >= 1000) {
-    remote1 = -1.0f;
-    remote2 = -1.0f;
-  }
+  bool slaveSampleReceived = requestSlaveSample();
+  float remote1 = slaveSampleReceived ? slaveSensor1Cm : -1.0f;
+  float remote2 = slaveSampleReceived ? slaveSensor2Cm : -1.0f;
 
   float closest = getClosestValidDistance(
     getClosestValidDistance(sensor1, sensor2),
     getClosestValidDistance(remote1, remote2)
   );
   PlayerPosition position = calculatePlayerPosition(sensor1, sensor2, remote1, remote2);
+  setBuzzerOutput(playerInDeadZone);
+  uint8_t buzzerCommand = playerInDeadZone ? 1 : 0;
+  esp_now_send(ESPNOW_BROADCAST_MAC, &buzzerCommand, sizeof(buzzerCommand));
 
   snprintf(
     buffer,
@@ -245,6 +415,8 @@ void buildSensorJson(char *buffer, size_t bufferSize) {
   if (position.valid) Serial.print(position.x, 3); else Serial.print("NaN");
   Serial.print(" | y: ");
   if (position.valid) Serial.println(position.y, 3); else Serial.println("NaN");
+  Serial.print(" | dead zone: ");
+  Serial.println(playerInDeadZone ? "YES" : "no");
 }
 
 // =======================================================================
@@ -330,14 +502,35 @@ const char DASHBOARD_HTML[] PROGMEM = R"HTML(
       const canvas = document.getElementById("positionMap");
       const ctx = canvas.getContext("2d");
       ctx.clearRect(0, 0, canvas.width, canvas.height);
+      const deadZoneDepth = 0.6;
+      const totalDepth = 1.8;
+      const depthToY = depth => canvas.height * (1 - depth / totalDepth);
+      const playAreaBottom = depthToY(deadZoneDepth);
+      const columnLines = [0.35 / 1.5, 1.15 / 1.5];
+      ctx.fillStyle = "#38272c";
+      ctx.fillRect(0, playAreaBottom, canvas.width, canvas.height - playAreaBottom);
       ctx.strokeStyle = "#425466";
       ctx.lineWidth = 2;
-      for (let i = 1; i < 3; i++) {
-        ctx.beginPath(); ctx.moveTo(canvas.width * i / 3, 0);
-        ctx.lineTo(canvas.width * i / 3, canvas.height); ctx.stroke();
-        ctx.beginPath(); ctx.moveTo(0, canvas.height * i / 3);
-        ctx.lineTo(canvas.width, canvas.height * i / 3); ctx.stroke();
+      for (const boundary of columnLines) {
+        ctx.beginPath(); ctx.moveTo(canvas.width * boundary, 0);
+        ctx.lineTo(canvas.width * boundary, playAreaBottom); ctx.stroke();
       }
+      for (const depth of [1.0, 1.4]) {
+        const rowY = depthToY(depth);
+        ctx.beginPath(); ctx.moveTo(0, rowY);
+        ctx.lineTo(canvas.width, rowY); ctx.stroke();
+      }
+      ctx.strokeRect(0, 0, canvas.width, playAreaBottom);
+      ctx.strokeStyle = "#a85b62";
+      ctx.beginPath(); ctx.moveTo(0, playAreaBottom);
+      ctx.lineTo(canvas.width, playAreaBottom); ctx.stroke();
+      ctx.fillStyle = "#e3a0a4";
+      ctx.font = "14px Consolas, monospace";
+      ctx.fillText("60 cm DEAD ZONE", 12, playAreaBottom + (canvas.height - playAreaBottom) / 2 + 5);
+      ctx.fillStyle = "#9eacb8";
+      ctx.fillText("ROW 3: 140-180 cm", 12, depthToY(1.6) + 5);
+      ctx.fillText("ROW 2: 100-140 cm", 12, depthToY(1.2) + 5);
+      ctx.fillText("ROW 1: 60-100 cm", 12, depthToY(0.8) + 5);
       if (x === null || y === null || x < 0 || y < 0) return;
       ctx.fillStyle = "#ffcc33";
       ctx.beginPath();
@@ -384,6 +577,8 @@ void handleData() {
 
 void setup() {
   pinMode(LED_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  noTone(BUZZER_PIN);
   pinMode(SENSOR_1_TRIG_PIN, OUTPUT);
   pinMode(SENSOR_1_ECHO_PIN, INPUT);
   pinMode(SENSOR_2_TRIG_PIN, OUTPUT);
@@ -427,15 +622,15 @@ void setup() {
   }
   esp_now_register_recv_cb(onDataReceived);
 
-  esp_now_peer_info_t slavePeer = {};
-  memcpy(slavePeer.peer_addr, SLAVE_MAC, 6);
-  slavePeer.channel = FIXED_CHANNEL;
-  slavePeer.encrypt = false;
-  slavePeer.ifidx = WIFI_IF_AP;
-  if (esp_now_add_peer(&slavePeer) != ESP_OK) {
-    Serial.println("Failed to add slave as ESP-NOW peer");
+  esp_now_peer_info_t broadcastPeer = {};
+  memcpy(broadcastPeer.peer_addr, ESPNOW_BROADCAST_MAC, 6);
+  broadcastPeer.channel = FIXED_CHANNEL;
+  broadcastPeer.encrypt = false;
+  broadcastPeer.ifidx = WIFI_IF_AP;
+  if (esp_now_add_peer(&broadcastPeer) != ESP_OK) {
+    Serial.println("Failed to add ESP-NOW broadcast peer");
   } else {
-    Serial.println("Slave registered as ESP-NOW peer");
+    Serial.println("ESP-NOW broadcast peer registered");
   }
 
   uint8_t primaryChannel;
@@ -467,5 +662,5 @@ void loop() {
   }
 
   digitalWrite(LED_PIN, LOW);
-  delay(100);
+  delay(20);
 }

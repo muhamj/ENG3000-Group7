@@ -10,8 +10,9 @@ import pygame
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-IMAGES_DIR = os.path.join(BASE_DIR, "images")
-FONTS_DIR = os.path.join(BASE_DIR, "fonts")
+ASSETS_DIR = os.path.join(BASE_DIR, "assets")
+IMAGES_DIR = ASSETS_DIR
+FONTS_DIR = os.path.join(ASSETS_DIR, "fonts")
 LOGO_IMAGE = os.path.join(IMAGES_DIR, "logo.png")
 PIXEL_FONT_PATH = os.path.join(FONTS_DIR, "PressStart2P.ttf")
 LED_FONT_PATH = os.path.join(FONTS_DIR, "VT323.ttf")
@@ -25,6 +26,15 @@ HIT_DISTANCE_CM = 5.0
 # squeezed into a fraction of a much larger nominal range.
 SENSOR_MAX_DISTANCE_CM = 200.0
 SENSOR_TIMEOUT_MS = 500
+BOX_BASELINE_CM = 150.0
+POSITION_MAP_DEPTH_CM = 180.0
+DEAD_ZONE_DEPTH_CM = 60.0
+PLAYABLE_ROW_START_DEPTH_CM = 55.0
+ROW_1_END_DEPTH_CM = 100.0
+ROW_2_END_DEPTH_CM = 140.0
+LEFT_COLUMN_END_CM = BOX_BASELINE_CM / 2.0 - 40.0
+RIGHT_COLUMN_START_CM = BOX_BASELINE_CM / 2.0 + 40.0
+POSITION_BOUNDARY_EPSILON_CM = 0.001
 
 # game_wifi.py no longer binds its own UDP socket - sensor_monitor.py owns
 # port 4210 and is the single process that reads the ESP32's UDP packets.
@@ -49,30 +59,30 @@ RIGHT_SENSOR_NAMES = ("sensor2", "sensor4")
 DEPTH_ROW_THRESHOLDS_CM = (50.0, 100.0)
 SCREEN_MARGIN = 20
 GRID_SIZE = 3
+GRID_GAP = 10
 MOLE_MIN_MS = 1000
 MOLE_MAX_MS = 3000
 MOLE_DEAD_DISPLAY_MS = 700
 HAMMER_WIND_MS = 200
+HAMMER_WIND_MS = 50
 SCORE_FONT_SIZE = 72
 # How long a player must continuously stay in one menu button's cell
 # before it's confirmed and acted on. This applies only to the menu
 # screens (main menu, difficulty select, demo) - the playable GAME
 # state keeps its own fast HAMMER_WIND_MS hit timing, unchanged.
-MENU_CONFIRM_MS = 3000
+MENU_CONFIRM_MS = 2000
 # Game states
 STATE_MAIN_MENU = "MAIN_MENU"
-STATE_SELECT_DIFFICULTY = "SELECT_DIFFICULTY"
-STATE_DEMO = "DEMO"
 STATE_GAME = "GAME"
 
 # Difficulty settings (min_ms, max_ms)
 DIFFICULTY_SETTINGS = {
-    "EASY": (1400, 3500),
-    "MEDIUM": (1000, 3000),
-    "HARD": (600, 1800),
+    "EASY": (2500, 4500),
+    "MEDIUM": (1800, 3500),
+    "HARD": (1200, 2500),
 }
 
-DEFAULT_DIFFICULTY = "MEDIUM"
+DEFAULT_DIFFICULTY = "EASY"
 
 # =============================================================================
 # ARCADE CABINET COLOUR PALETTE
@@ -126,6 +136,14 @@ def extract_distances(packet):
         if 0 < value <= SENSOR_MAX_DISTANCE_CM:
             distances[name] = value
 
+    for name in ("x", "y"):
+        try:
+            value = float(packet[name])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if 0.0 <= value <= 1.0:
+            distances[name] = value
+
     if not distances:
         return None
     return distances
@@ -175,6 +193,33 @@ def sensor_cell_from_fraction(fraction_x, row):
     """Convert a continuous 0..1 horizontal fraction and a row into a 3x3
     grid cell index, by splitting the width into three equal zones."""
     column = min(GRID_SIZE - 1, int(fraction_x * GRID_SIZE))
+    return row * GRID_SIZE + column
+
+
+def sensor_cell_from_position(x_fraction, y_fraction):
+    """Map firmware coordinates to physical rows and 40 cm side columns."""
+    x_cm = min(max(x_fraction, 0.0), 1.0) * BOX_BASELINE_CM
+    depth_cm = (1.0 - y_fraction) * POSITION_MAP_DEPTH_CM
+    if (
+        depth_cm <= PLAYABLE_ROW_START_DEPTH_CM + POSITION_BOUNDARY_EPSILON_CM
+        or depth_cm > POSITION_MAP_DEPTH_CM + POSITION_BOUNDARY_EPSILON_CM
+    ):
+        return None
+
+    if x_cm <= LEFT_COLUMN_END_CM + POSITION_BOUNDARY_EPSILON_CM:
+        column = 0
+    elif x_cm >= RIGHT_COLUMN_START_CM - POSITION_BOUNDARY_EPSILON_CM:
+        column = 2
+    else:
+        column = 1
+
+    if depth_cm < ROW_1_END_DEPTH_CM - POSITION_BOUNDARY_EPSILON_CM:
+        near_to_far_row = 0
+    elif depth_cm < ROW_2_END_DEPTH_CM - POSITION_BOUNDARY_EPSILON_CM:
+        near_to_far_row = 1
+    else:
+        near_to_far_row = 2
+    row = GRID_SIZE - 1 - near_to_far_row
     return row * GRID_SIZE + column
 
 
@@ -282,25 +327,12 @@ def scale_to_fit(surface, max_width, max_height):
     return surface
 
 
-def get_grid_area(title_surface):
-    title_height = title_surface.get_height()
-    title_y = SCREEN_MARGIN
-    play_area_top = title_y + title_height + SCREEN_MARGIN
-    # Compute cell size to fit horizontally and in the remaining vertical space
-    grid_cell_size = min(
-        (WINDOW_WIDTH - (SCREEN_MARGIN * 2)) / GRID_SIZE,
-        (WINDOW_HEIGHT - play_area_top - SCREEN_MARGIN * 1) / GRID_SIZE,
-    )
-
-    grid_size_pixels = grid_cell_size * GRID_SIZE
-
-    # Center horizontally
-    grid_start_x = int((WINDOW_WIDTH - grid_size_pixels) // 2)
-
-    # Center vertically within the play area below the title
-    available_height = WINDOW_HEIGHT - play_area_top - SCREEN_MARGIN
-    grid_start_y = int(play_area_top + max(0, (available_height - grid_size_pixels) // 2))
-
+def get_grid_area(_title_surface=None):
+    cabinet_width = min(520, int(WINDOW_WIDTH * 0.95))
+    grid_width = cabinet_width - 74
+    grid_cell_size = (grid_width - GRID_GAP * (GRID_SIZE - 1)) / GRID_SIZE
+    grid_start_x = int((WINDOW_WIDTH - grid_width) // 2)
+    grid_start_y = int((WINDOW_HEIGHT - grid_width) // 2)
     return grid_start_x, grid_start_y, grid_cell_size
 
 
@@ -315,9 +347,23 @@ def random_grid_index(current_index=None):
 
 def cell_rect(cell_index, grid_start_x, grid_start_y, cell_size):
     row, col = divmod(cell_index, GRID_SIZE)
-    x = grid_start_x + col * cell_size
-    y = grid_start_y + row * cell_size
+    step = cell_size + GRID_GAP
+    x = grid_start_x + col * step
+    y = grid_start_y + row * step
     return pygame.Rect(int(x), int(y), int(math.ceil(cell_size)), int(math.ceil(cell_size)))
+
+
+def grid_cell_at_position(position, grid_start_x, grid_start_y, cell_size):
+    relative_x = position[0] - grid_start_x
+    relative_y = position[1] - grid_start_y
+    step = cell_size + GRID_GAP
+    col = int(relative_x // step)
+    row = int(relative_y // step)
+    if col < 0 or col >= GRID_SIZE or row < 0 or row >= GRID_SIZE:
+        return None
+    if relative_x - col * step >= cell_size or relative_y - row * step >= cell_size:
+        return None
+    return row * GRID_SIZE + col
 
 
 def cell_center(cell_index, grid_start_x, grid_start_y, cell_size):
@@ -331,28 +377,34 @@ def cell_center(cell_index, grid_start_x, grid_start_y, cell_size):
 # Draws the dark wood cabinet body, metal bezel and inset black screen that
 # the whole game sits inside, matching the arcade cabinet mockup's frame.
 
-def draw_cabinet_background(screen):
-    screen.fill(COL_WOOD)
+def draw_cabinet_background(screen, field_rect):
+    screen.fill((4, 4, 9))
+    cabinet_rect = field_rect.inflate(46, 46)
+    pygame.draw.rect(screen, (0, 0, 3), cabinet_rect.move(0, 8), border_radius=8)
+    pygame.draw.rect(screen, COL_WOOD, cabinet_rect, border_radius=8)
+    pygame.draw.rect(screen, (22, 22, 28), cabinet_rect, width=1, border_radius=8)
 
-    # Corner bolts
     bolt_positions = [
-        (16, 16), (WINDOW_WIDTH - 16, 16),
-        (16, WINDOW_HEIGHT - 16), (WINDOW_WIDTH - 16, WINDOW_HEIGHT - 16),
+        (cabinet_rect.left + 14, cabinet_rect.top + 14),
+        (cabinet_rect.right - 14, cabinet_rect.top + 14),
+        (cabinet_rect.left + 14, cabinet_rect.bottom - 14),
+        (cabinet_rect.right - 14, cabinet_rect.bottom - 14),
     ]
     for bx, by in bolt_positions:
-        pygame.draw.circle(screen, COL_BEZEL_LO, (bx, by), 7)
-        pygame.draw.circle(screen, COL_BEZEL_HI, (bx - 2, by - 2), 3)
+        pygame.draw.circle(screen, COL_BEZEL_LO, (bx, by), 6)
+        pygame.draw.circle(screen, COL_BEZEL_HI, (bx - 2, by - 2), 2)
 
 
 def draw_bezel_and_field(screen, field_rect):
-    # Metal bezel frame around the screen
-    bezel_rect = field_rect.inflate(24, 24)
+    bezel_rect = field_rect.inflate(18, 18)
     pygame.draw.rect(screen, COL_BEZEL_MID, bezel_rect, border_radius=10)
     pygame.draw.rect(screen, COL_BEZEL_HI, bezel_rect, width=2, border_radius=10)
 
     # Black screen field
     pygame.draw.rect(screen, COL_SCREEN_BG, field_rect, border_radius=4)
     pygame.draw.rect(screen, COL_CAB_BLACK, field_rect, width=2, border_radius=4)
+    for scan_y in range(field_rect.top + 2, field_rect.bottom, 3):
+        pygame.draw.line(screen, (8, 8, 12), (field_rect.left + 2, scan_y), (field_rect.right - 2, scan_y))
 
 
 # =============================================================================
@@ -428,16 +480,9 @@ def draw_image_in_rect(screen, image, rect):
 
 
 def get_menu_hot_cells(state):
-    """Return the set of grid cell indices that are actionable buttons for
-    the given menu screen. These are the only cells that accumulate dwell
-    time toward a confirmed selection. GAME is not a menu screen - it uses
-    its own instant hammer wind-up/hit logic instead, unaffected by this."""
+    """Return the difficulty buttons that accumulate menu dwell time."""
     if state == STATE_MAIN_MENU:
-        return {3, 4}
-    if state == STATE_SELECT_DIFFICULTY:
-        return {1, 3, 5, 7}
-    if state == STATE_DEMO:
-        return {8}
+        return {3, 4, 5}
     return set()
 
 
@@ -468,6 +513,27 @@ def draw_dwell_progress_bar(screen, label_font, rect, progress):
     countdown_x = bar_x + (bar_width - countdown.get_width()) // 2
     countdown_y = bar_y - countdown.get_height() - 3
     screen.blit(countdown, (countdown_x, countdown_y))
+
+
+def draw_help_tooltip(screen, anchor_rect, field_rect, title_font, body_font):
+    tooltip_rect = pygame.Rect(
+        anchor_rect.centerx - 170,
+        anchor_rect.top - 114,
+        340,
+        106,
+    )
+    tooltip_rect.clamp_ip(field_rect)
+    pygame.draw.rect(screen, (5, 5, 5), tooltip_rect, border_radius=6)
+    pygame.draw.rect(screen, COL_AMBER, tooltip_rect, width=2, border_radius=6)
+    title = title_font.render("HOW TO PLAY", True, COL_AMBER)
+    screen.blit(title, (tooltip_rect.x + 12, tooltip_rect.y + 9))
+    for index, text in enumerate((
+        "Move to aim the hammer.",
+        "Hover a difficulty for 2 seconds.",
+        "Swing over a mole to score.",
+    )):
+        line = body_font.render(text, True, COL_CREAM)
+        screen.blit(line, (tooltip_rect.x + 12, tooltip_rect.y + 28 + index * 22))
 
 
 # =============================================================================
@@ -573,7 +639,7 @@ def draw_hit_burst(screen, rect, label_font, alpha_fraction):
     """Floating '+1' text on a successful hit, matching .hit-burst/floatUp."""
     if alpha_fraction <= 0:
         return
-    text_surf = label_font.render("+1", True, COL_AMBER)
+    text_surf = label_font.render("+10", True, COL_AMBER)
     text_surf.set_alpha(int(255 * alpha_fraction))
     rise = int(26 * (1.0 - alpha_fraction))
     x = rect.centerx - text_surf.get_width() // 2
@@ -652,30 +718,23 @@ def main():
     # VT323 for the LED-style score readout - matching 'PixelArcade' and
     # 'LEDMono' in the HTML mockup.
     pixel_font_title = load_font(PIXEL_FONT_PATH, 18)
-    pixel_font_label = load_font(PIXEL_FONT_PATH, 13)
     pixel_font_small = load_font(PIXEL_FONT_PATH, 9)
     led_font_score = load_font(LED_FONT_PATH, SCORE_FONT_SIZE)
     led_font_instructions = load_font(LED_FONT_PATH, 22)
     label_font = load_font(LED_FONT_PATH, 26)
 
-    title_height = SCORE_FONT_SIZE + 20
-    title_surface = pygame.Surface((WINDOW_WIDTH, title_height), pygame.SRCALPHA)
-
-    title_x = 0
-    title_y = SCREEN_MARGIN
-
-    grid_start_x, grid_start_y, cell_size = get_grid_area(title_surface)
-
+    grid_start_x, grid_start_y, cell_size = get_grid_area()
+    grid_extent = int(cell_size * GRID_SIZE + GRID_GAP * (GRID_SIZE - 1))
     field_rect = pygame.Rect(
-        SCREEN_MARGIN - 10,
-        title_y - 10,
-        WINDOW_WIDTH - 2 * (SCREEN_MARGIN - 10),
-        (grid_start_y + cell_size * GRID_SIZE) - title_y + 20,
+        grid_start_x - 14,
+        grid_start_y - 14,
+        grid_extent + 28,
+        grid_extent + 28,
     )
-
+    cabinet_rect = field_rect.inflate(46, 46)
     # Logo (replaces the old title-number title bar on the main menu)
     logo_surface = load_image(LOGO_IMAGE).convert_alpha()
-    logo_target_w = int(cell_size * 2.6)
+    logo_target_w = int(grid_extent * 0.8)
     logo_target_h = max(1, int(logo_surface.get_height() * logo_target_w / logo_surface.get_width()))
     logo_surface = pygame.transform.smoothscale(logo_surface, (logo_target_w, min(logo_target_h, int(cell_size * 0.9))))
 
@@ -725,13 +784,23 @@ def main():
     mouse_focused = False
     mouse_pos = (0, 0)
     sensor_cell = None
+    sensor_position = None
     sensor_last_update = 0
-    demo_active = False
+    back_to_menu_rect = pygame.Rect(field_rect.right - 68, field_rect.top + 6, 58, 22)
 
     while running:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
+            elif (
+                event.type == pygame.MOUSEBUTTONDOWN
+                and event.button == 1
+                and state == STATE_GAME
+                and back_to_menu_rect.collidepoint(event.pos)
+            ):
+                state = STATE_MAIN_MENU
+                hammer_winding = False
+                menu_dwell_cell = None
             
         # Per-frame: update mouse proximity wind-up and mole timers
         try:
@@ -746,42 +815,42 @@ def main():
         if reader is not None:
             distances = reader.read_distances()
             if distances is not None:
-                left, right = combine_left_right(distances)
-                fraction_x = sensor_fraction_x(left, right)
-                if fraction_x is not None:
-                    row = sensor_fraction_row(left, right)
-                    sensor_cell = sensor_cell_from_fraction(fraction_x, row)
+                if "x" in distances and "y" in distances:
+                    sensor_cell = sensor_cell_from_position(distances["x"], distances["y"])
+                    sensor_position = (distances["x"], distances["y"])
                     sensor_last_update = pygame.time.get_ticks()
-                    print(f"Sensor position: cell={sensor_cell} (left={left}, right={right})")
+                    print(f"Sensor position: cell={sensor_cell} (x={distances['x']:.3f}, y={distances['y']:.3f})")
+                else:
+                    sensor_position = None
+                    left, right = combine_left_right(distances)
+                    fraction_x = sensor_fraction_x(left, right)
+                    if fraction_x is not None:
+                        row = sensor_fraction_row(left, right)
+                        sensor_cell = sensor_cell_from_fraction(fraction_x, row)
+                        sensor_last_update = pygame.time.get_ticks()
+                        print(f"Sensor position: cell={sensor_cell} (left={left}, right={right})")
 
         # Sensor input takes priority when a complete frame is available.
         mx, my = mouse_pos
-        grid_size_pixels = int(cell_size * GRID_SIZE)
-        if (
-            mx >= int(grid_start_x)
-            and mx < int(grid_start_x + grid_size_pixels)
-            and my >= int(grid_start_y)
-            and my < int(grid_start_y + grid_size_pixels)
-        ):
-            mcol = int((mx - grid_start_x) // cell_size)
-            mrow = int((my - grid_start_y) // cell_size)
-            mouse_cell = sensor_cell if sensor_cell is not None else mrow * GRID_SIZE + mcol
-        else:
-            mouse_cell = sensor_cell
+        mouse_grid_cell = grid_cell_at_position(
+            mouse_pos, grid_start_x, grid_start_y, cell_size
+        )
+        mouse_cell = sensor_cell if sensor_cell is not None else mouse_grid_cell
 
         control_pos = mouse_pos
-        if sensor_cell is not None:
-            sensor_col = sensor_cell % GRID_SIZE
-            sensor_row = sensor_cell // GRID_SIZE
-            # Fully snapped to the cell center on both axes.
+        if sensor_position is not None:
             control_pos = (
-                int(grid_start_x + (sensor_col + 0.5) * cell_size),
-                int(grid_start_y + (sensor_row + 0.5) * cell_size),
+                int(grid_start_x + sensor_position[0] * grid_extent),
+                int(grid_start_y + sensor_position[1] * grid_extent),
             )
+        elif sensor_cell is not None:
+            snapped_rect = cell_rect(sensor_cell, grid_start_x, grid_start_y, cell_size)
+            control_pos = snapped_rect.center
 
         now = pygame.time.get_ticks()
         if now - sensor_last_update > SENSOR_TIMEOUT_MS:
             sensor_cell = None
+            sensor_position = None
 
         # endregion
 
@@ -813,82 +882,21 @@ def main():
 
 
         # region SCREEN 1 - MAIN MENU
-        # Handles navigation from the main menu only.
-        # Start -> Difficulty Selection
-        # Demo  -> Demo Screen
         if state == STATE_MAIN_MENU:
-            if menu_confirmed_cell == 4:
-                # Play the hammer hit animation when confirming a menu option.
+            selected_difficulty = {3: "EASY", 4: "MEDIUM", 5: "HARD"}.get(menu_confirmed_cell)
+            if selected_difficulty is not None:
                 hammer_pressed = True
                 hammer_press_start = now
-                state = STATE_SELECT_DIFFICULTY
-                print("Entered Select Difficulty screen")
-            elif menu_confirmed_cell == 3:
-                # Play the hammer hit animation when confirming a menu option.
-                hammer_pressed = True
-                hammer_press_start = now
-                state = STATE_DEMO
-                demo_active = True
-                demo_next_action = now + 600
-                # place demo mole
-                mole_cell_index = random.randint(0, GRID_SIZE * GRID_SIZE - 1)
-                mole_state = "alive"
-                mole_pop_start = now
-                mole_pop_from = "alive"
-                mole_expire_time = now + 800
-                print("Entered Demo screen")
-
-
-        # endregion
-
-        # region SCREEN 2 - DIFFICULTY SELECTION
-        # Handles choosing EASY, MEDIUM or HARD.
-        if state == STATE_SELECT_DIFFICULTY:
-            # Confirm a difficulty on dwelling in grid squares 1,3,5, or
-            # go back to the main menu on dwelling in square 7.
-            if menu_confirmed_cell == 7:
-                hammer_pressed = True
-                hammer_press_start = now
-                state = STATE_MAIN_MENU
-                print("Returned to main menu")
-            elif menu_confirmed_cell == 1:
-                selected = "HARD"
-            elif menu_confirmed_cell == 3:
-                selected = "EASY"
-            elif menu_confirmed_cell == 5:
-                selected = "MEDIUM"
-            else:
-                selected = None
-
-            if menu_confirmed_cell != 7 and selected is not None:
-                # Play the hammer hit animation when confirming a difficulty.
-                hammer_pressed = True
-                hammer_press_start = now
-                current_difficulty = selected
+                current_difficulty = selected_difficulty
                 MOLE_MIN_CURRENT, MOLE_MAX_CURRENT = DIFFICULTY_SETTINGS[current_difficulty]
                 score = 0
                 mole_cell_index = random.randint(0, GRID_SIZE * GRID_SIZE - 1)
                 mole_state = "alive"
                 mole_pop_start = now
                 mole_pop_from = "alive"
-                now = pygame.time.get_ticks()
                 mole_expire_time = now + random.randint(MOLE_MIN_CURRENT, MOLE_MAX_CURRENT)
                 state = STATE_GAME
                 print(f"Difficulty {current_difficulty} selected; starting game")
-
-
-        # endregion
-
-        # region SCREEN 3 - DEMO SCREEN
-        
-        # Will need to include demo on how it works
-
-        if state == STATE_DEMO and menu_confirmed_cell == 8:
-            hammer_pressed = True
-            hammer_press_start = now
-            state = STATE_MAIN_MENU
-            demo_active = False
-            print("Returned to main menu")
 
 
         # endregion
@@ -917,7 +925,8 @@ def main():
                     mole_pop_start = now
                     mole_pop_from = "dead"
                     hit_burst_until = now + 550
-                    score += 1
+                    mole_dead_until = now + 260
+                    score += 10
                     print(f"Hit! {score} points.")
 
 
@@ -948,15 +957,16 @@ def main():
         # endregion
 
         # region RENDERING - CABINET / COMMON BACKGROUND / SCORE / GRID
-        draw_cabinet_background(screen)
+        draw_cabinet_background(screen, field_rect)
         draw_bezel_and_field(screen, field_rect)
 
-        # Score is only shown during the demo and actual gameplay.
-        # It is hidden on the main menu and difficulty selection screens.
-        if state in (STATE_DEMO, STATE_GAME):
+        if state == STATE_GAME:
             score_surf = led_font_score.render(str(score), True, COL_CREAM)
-            score_x = (WINDOW_WIDTH - score_surf.get_width()) // 2
-            screen.blit(score_surf, (score_x, title_y))
+            score_surf = pygame.transform.smoothscale(
+                score_surf,
+                (max(1, int(score_surf.get_width() * 0.42)), max(1, int(score_surf.get_height() * 0.42))),
+            )
+            screen.blit(score_surf, (cabinet_rect.centerx - score_surf.get_width() // 2, cabinet_rect.top + 3))
 
         # endregion
 
@@ -967,68 +977,36 @@ def main():
         # SCREEN 1 - MAIN MENU
         # ---------------------------------------------------------------------
         if state == STATE_MAIN_MENU:
-            title_rect = pygame.Rect(grid_start_x, grid_start_y, int(cell_size * GRID_SIZE), int(cell_size))
+            title_rect = pygame.Rect(grid_start_x, grid_start_y, grid_extent, int(cell_size))
             draw_panel_cell(screen, title_rect, COL_MAZE_BLUE)
             draw_perimeter_chase(screen, title_rect, 28, now, 1800, True)
             draw_image_in_rect(screen, logo_surface, title_rect)
 
-            demo_rect = cell_rect(3, grid_start_x, grid_start_y, cell_size)
-            draw_panel_cell(screen, demo_rect, COL_MAZE_BLUE)
-            draw_label(screen, pixel_font_small, demo_rect, "DEMO", COL_CREAM)
-
-            start_rect = cell_rect(4, grid_start_x, grid_start_y, cell_size)
-            draw_panel_cell(screen, start_rect, COL_AMBER)
-            draw_label(screen, pixel_font_small, start_rect, "START", COL_AMBER)
-
-            for idx in (5, 6, 7, 8):
-                blank_rect = cell_rect(idx, grid_start_x, grid_start_y, cell_size)
-                draw_panel_cell(screen, blank_rect, COL_MAZE_BLUE)
-                pygame.draw.circle(screen, COL_DOT, blank_rect.center, 3)
-
-
-        # ---------------------------------------------------------------------
-        # SCREEN 2 - DIFFICULTY SELECTION
-        # ---------------------------------------------------------------------
-        if state == STATE_SELECT_DIFFICULTY:
             diff_cells = {
-                1: ("HARD", COL_BLUE_DEEP),
                 3: ("EASY", COL_BLUE_LT),
-                5: ("MEDIUM", COL_AMBER),
+                4: ("MEDIUM", COL_AMBER),
+                5: ("HARD", COL_BLUE_DEEP),
             }
             for idx, (label, color) in diff_cells.items():
                 rect = cell_rect(idx, grid_start_x, grid_start_y, cell_size)
-                charging = (menu_dwell_cell == idx)
+                charging = menu_dwell_cell == idx
                 draw_panel_cell(screen, rect, color)
                 draw_perimeter_chase(screen, rect, 20, now, 1800, charging)
                 draw_label(screen, pixel_font_small, rect, label, color)
 
-            back_rect = cell_rect(7, grid_start_x, grid_start_y, cell_size)
-            draw_panel_cell(screen, back_rect, COL_MAZE_BLUE)
-            draw_label(screen, pixel_font_small, back_rect, "BACK", COL_CREAM)
-
-            for idx in (0, 2, 6, 8):
+            for idx in (6, 8):
                 blank_rect = cell_rect(idx, grid_start_x, grid_start_y, cell_size)
                 draw_panel_cell(screen, blank_rect, COL_MAZE_BLUE)
                 pygame.draw.circle(screen, COL_DOT, blank_rect.center, 3)
 
-
-        # ---------------------------------------------------------------------
-        # SCREEN 3 - DEMO SCREEN
-        # ---------------------------------------------------------------------
-        if state == STATE_DEMO:
-            back_rect = cell_rect(8, grid_start_x, grid_start_y, cell_size)
-            draw_panel_cell(screen, back_rect, COL_MAZE_BLUE)
-            draw_label(screen, pixel_font_small, back_rect, "MENU", COL_CREAM)
-
-            # show brief instruction lines near the top
-            lines = [
-                "Demo: move to control the hammer",
-                "Move into the mole's square to hit it",
-                "Hold the bottom-right square to return",
-            ]
-            for i, line in enumerate(lines):
-                s = led_font_instructions.render(line, True, COL_CREAM)
-                screen.blit(s, (SCREEN_MARGIN, title_y + i * 24))
+            help_rect = cell_rect(7, grid_start_x, grid_start_y, cell_size)
+            help_color = COL_AMBER if mouse_cell == 7 else COL_MAZE_BLUE
+            draw_panel_cell(screen, help_rect, help_color)
+            draw_label(screen, pixel_font_title, help_rect, "?", COL_CREAM)
+            help_label = pixel_font_small.render("HELP", True, COL_CREAM)
+            screen.blit(help_label, (help_rect.centerx - help_label.get_width() // 2, help_rect.centery + 22))
+            if mouse_cell == 7:
+                draw_help_tooltip(screen, help_rect, field_rect, pixel_font_small, led_font_instructions)
 
 
         # endregion
@@ -1053,6 +1031,8 @@ def main():
         # region RENDERING - GAME
         # Draw hole/mound + mole depending on state
         if state == STATE_GAME:
+            draw_panel_cell(screen, back_to_menu_rect, COL_MAZE_BLUE, border_width=1, radius=4)
+            draw_label(screen, pixel_font_small, back_to_menu_rect, "MENU", COL_CREAM)
             for idx in range(GRID_SIZE * GRID_SIZE):
                 rect = cell_rect(idx, grid_start_x, grid_start_y, cell_size)
                 draw_hole_and_mound(screen, rect)
@@ -1085,7 +1065,7 @@ def main():
         # The hammer is shared by the playable game and demo.
         # Draw hammer cursor only when we have live sensor input, so mouse
         # movement never drives it (this is a sensor-controlled cabinet).
-        if sensor_cell is not None:
+        if sensor_cell is not None or mouse_focused:
             pygame.mouse.set_visible(False)
 
             wind_progress = 0.0

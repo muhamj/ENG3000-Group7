@@ -6,8 +6,8 @@
     "organization": null,
     "repositoryId": null,
     "repositoryName": null,
-    "createdAt": "2026-09-29T02:18:08.141Z",
-    "updatedAt": "2026-09-29T02:18:08.141Z",
+    "createdAt": "2026-10-04T03:16:02.196Z",
+    "updatedAt": "2026-10-04T03:16:02.196Z",
     "languages": [
       "CPP",
       "HTML",
@@ -1882,14 +1882,11 @@
         {
           "patternId": "Lizard_file-nloc-medium",
           "parameters": {
-            "threshold": "640"
+            "threshold": "650"
           }
         },
         {
-          "patternId": "Lizard_nloc-medium",
-          "parameters": {
-            "threshold": "60"
-          }
+          "patternId": "Lizard_nloc-medium"
         },
         {
           "patternId": "Lizard_parameter-count-medium"
