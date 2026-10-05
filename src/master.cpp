@@ -109,6 +109,8 @@ const float DEAD_ZONE_RELEASE_DEPTH_M = 0.55f;
 // Depth represented by graph.
 const float POSITION_MAP_DEPTH_M = 1.8f;
 
+const float X_GAIN = 2.0f;
+
 // ---------------------------------------------------------------------
 // Position smoothing
 // ---------------------------------------------------------------------
@@ -1149,8 +1151,9 @@ PlayerPosition calculatePlayerPosition(
           // This is deliberately limited.
           // ---------------------------------------------------------
 
-          xMeters +=
-            lateralCorrection;
+          xMeters =
+  D * 0.5f +
+  X_GAIN * (xMeters - D * 0.5f);
 
           // ---------------------------------------------------------
           // Keep X inside physical area.
