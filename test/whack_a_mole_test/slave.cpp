@@ -16,7 +16,9 @@ const int SENSOR_2_ECHO_PIN = 14;
 const int LED_PIN = 2;
 const int BUZZER_PIN = 18;
 const unsigned int BUZZER_FREQUENCY_HZ = 2200;
-const unsigned long SENSOR_SETTLE_DELAY_MS = 60;
+// Matched to master's 90ms settle delay to avoid ultrasonic crosstalk
+// between this board's own two sensors.
+const unsigned long SENSOR_SETTLE_DELAY_MS = 90;
 const uint8_t SLAVE_SAMPLE_REQUEST = 2;
 
 struct SensorPacket {

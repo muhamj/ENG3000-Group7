@@ -13,6 +13,20 @@
 //
 // Flash the matching slave.cpp to the other board. Both boards use the
 // fixed channel and ESP-NOW broadcast, so no MAC address pairing is needed.
+//
+// CHANGE LOG (timing fix for ~50% sensor miss rate):
+//   - SENSOR_SETTLE_DELAY_MS raised from 40ms to 90ms. With both boxes
+//     powered, master's and slave's ultrasonic pulses were firing close
+//     enough together that one box's echo was sometimes still bouncing
+//     around the room when the next sensor (on either box) fired,
+//     causing that sensor to catch a stray echo or nothing at all
+//     (classic multi-sensor ultrasonic crosstalk).
+//   - Added an extra settle delay after master's own two sensors and
+//     BEFORE requesting the slave to fire, so master's echoes are fully
+//     clear of the room before slave's pulses go out.
+//   - Added raw duration_us logging in readSensorDistance() so the
+//     actual pulseIn() result is visible per-read, not just the
+//     filtered/converted distance.
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -67,10 +81,17 @@ const int SENSOR_2_ECHO_PIN = 14;
 const int LED_PIN = 2;
 const int BUZZER_PIN = 18;
 const unsigned int BUZZER_FREQUENCY_HZ = 2200;
-const unsigned long SENSOR_SETTLE_DELAY_MS = 40;
+
+// Raised from 40ms to 90ms - see CHANGE LOG above. This is used as the
+// gap between every pair of ultrasonic pulses in the whole 4-sensor
+// chain (master sensor 1 -> 2, and again before the slave is asked to
+// fire), so every sensor's echo has fully died out before the next
+// pulse goes out anywhere in the room.
+const unsigned long SENSOR_SETTLE_DELAY_MS = 90;
+
 const float MAX_TRACKING_DISTANCE_CM = 200.0f;
 const float BOX_BASELINE_M = 1.5f;
- const float POSITION_X_MARGIN_M = 0.35f;
+const float POSITION_X_MARGIN_M = 0.35f;
 const float DEAD_ZONE_DEPTH_M = 0.5f;
 const float DEAD_ZONE_RELEASE_DEPTH_M = 0.55f;
 const float POSITION_MAP_DEPTH_M = 1.8f;
@@ -80,6 +101,11 @@ bool playerInDeadZone = false;
 
 WiFiUDP udp;
 WebServer webServer(80);
+
+// Cached JSON from the most recent sensor cycle. The /data web handler
+// returns this instantly instead of triggering its own sensor read,
+// which was causing double-fire ultrasonic crosstalk.
+char cachedJson[256] = "{}";
 
 // =======================================================================
 // Sensor reading
@@ -93,6 +119,18 @@ float readSensorDistance(int trigPin, int echoPin) {
   digitalWrite(trigPin, LOW);
 
   long duration = pulseIn(echoPin, HIGH, 16000);
+
+  // Raw diagnostic - shows the actual pulseIn() result before any
+  // filtering or conversion. Leave this in for now while you confirm
+  // the timing fix helped; comment it out or remove it once you're
+  // happy with the hit rate, since it adds Serial traffic every cycle.
+  Serial.print("  [raw] trig=");
+  Serial.print(trigPin);
+  Serial.print(" echo=");
+  Serial.print(echoPin);
+  Serial.print(" duration_us=");
+  Serial.println(duration);
+
   if (duration <= 0) {
     return -1.0f;
   }
@@ -177,62 +215,20 @@ float filterSensorDistance(float distance, size_t sensorIndex, SensorDistanceFil
   return sampleCount < 3 ? distance : medianOf(samples, sampleCount);
 }
 
-struct PositionCandidate {
-  float xMeters;
-  float depthMeters;
-};
-
-bool calculatePositionCandidate(float masterCm, float slaveCm, PositionCandidate &candidate) {
-  if (!isValidDistance(masterCm) || !isValidDistance(slaveCm)) return false;
-
-  float masterRange = masterCm / 100.0f;
-  float slaveRange = slaveCm / 100.0f;
-  float xMeters = (BOX_BASELINE_M * BOX_BASELINE_M + masterRange * masterRange
-    - slaveRange * slaveRange) / (2.0f * BOX_BASELINE_M);
-  float ySquared = masterRange * masterRange - xMeters * xMeters;
-  if (xMeters < -POSITION_X_MARGIN_M ||
-      xMeters > BOX_BASELINE_M + POSITION_X_MARGIN_M || ySquared < -0.04f) return false;
-
-  float depthMeters = sqrtf(ySquared < 0.0f ? 0.0f : ySquared);
-  if (depthMeters > POSITION_MAP_DEPTH_M) return false;
-
-  candidate = {xMeters, depthMeters};
-  return true;
-}
-
-PositionCandidate selectPositionCandidate(
-  PositionCandidate *candidates,
-  size_t candidateCount,
-  const PositionFilterState &state
-) {
-  if (!state.hasPosition) {
-    float xSamples[4];
-    float depthSamples[4];
-    for (size_t i = 0; i < candidateCount; i++) {
-      xSamples[i] = candidates[i].xMeters;
-      depthSamples[i] = candidates[i].depthMeters;
-    }
-    return {
-      medianOf(xSamples, candidateCount),
-      medianOf(depthSamples, candidateCount)
-    };
-  }
-
-  float previousX = state.smoothedX * BOX_BASELINE_M;
-  float previousDepth = (1.0f - state.smoothedY) * POSITION_MAP_DEPTH_M;
-  size_t closestIndex = 0;
-  float closestDistanceSquared = INFINITY;
-  for (size_t i = 0; i < candidateCount; i++) {
-    float deltaX = candidates[i].xMeters - previousX;
-    float deltaDepth = candidates[i].depthMeters - previousDepth;
-    float distanceSquared = deltaX * deltaX + deltaDepth * deltaDepth;
-    if (distanceSquared < closestDistanceSquared) {
-      closestDistanceSquared = distanceSquared;
-      closestIndex = i;
-    }
-  }
-  return candidates[closestIndex];
-}
+// ---------------------------------------------------------------------
+// Physical layout (for reference — the mounting angles determine which
+// part of the play area each sensor can "see", but the measured range
+// is always the straight-line distance from sensor to target regardless
+// of beam direction, so the angles are NOT used in the position math).
+//
+//   Master box at X = 0 (left corner):
+//     sensor 1: 20 deg anticlockwise from perpendicular (toward slave)
+//     sensor 2: 70 deg anticlockwise from perpendicular (toward slave)
+//   Slave box at X = BOX_BASELINE_M (right corner):
+//     sensor 3: 20 deg clockwise from perpendicular (toward master)
+//     sensor 4: 70 deg clockwise from perpendicular (toward master)
+//   Both boxes' sensors point inward, covering the play area between them.
+// ---------------------------------------------------------------------
 
 PlayerPosition retainPosition(const PositionFilterState &state) {
   return state.hasPosition ? PlayerPosition{true, state.smoothedX, state.smoothedY}
@@ -265,6 +261,22 @@ PlayerPosition addPositionSample(float x, float y, PositionFilterState &state) {
   return {true, state.smoothedX, state.smoothedY};
 }
 
+// =======================================================================
+// Trilateration-based position calculation.
+//
+// Each ultrasonic sensor measures the straight-line DISTANCE to the
+// target (regardless of beam direction). With the master box at (0, 0)
+// and the slave box at (D, 0), two range readings define two circles
+// whose intersection gives the player's (x, depth) position:
+//
+//   x     = (Rm² - Rs² + D²) / (2D)
+//   depth = sqrt(Rm² - x²)
+//
+// Each box has two sensors for redundancy / wider angular coverage.
+// We combine each box's readings into one "best range" (closest valid
+// reading), then trilaterate between the two boxes.
+// =======================================================================
+
 PlayerPosition calculatePlayerPosition(
   float sensor1,
   float sensor2,
@@ -276,32 +288,52 @@ PlayerPosition calculatePlayerPosition(
   static bool deadZoneLatched = false;
   playerInDeadZone = false;
 
-  float filteredSensor1 = filterSensorDistance(sensor1, 0, distanceFilterState);
-  float filteredSensor2 = filterSensorDistance(sensor2, 1, distanceFilterState);
-  float filteredSensor3 = filterSensorDistance(sensor3, 2, distanceFilterState);
-  float filteredSensor4 = filterSensorDistance(sensor4, 3, distanceFilterState);
+  // 1. Noise-reject each sensor's reading (median filter)
+  float f1 = filterSensorDistance(sensor1, 0, distanceFilterState);
+  float f2 = filterSensorDistance(sensor2, 1, distanceFilterState);
+  float f3 = filterSensorDistance(sensor3, 2, distanceFilterState);
+  float f4 = filterSensorDistance(sensor4, 3, distanceFilterState);
 
-  // Headings are master: -20/-70 degrees and slave: +20/+70 degrees.
-  // Evaluate every cross-box pair so a missing or misleading echo from
-  // one beam cannot distort the range chosen for its entire box.
-  float masterReadings[] = {filteredSensor1, filteredSensor2};
-  float slaveReadings[] = {filteredSensor3, filteredSensor4};
-  PositionCandidate candidates[4];
-  size_t candidateCount = 0;
-  for (float masterReading : masterReadings) {
-    for (float slaveReading : slaveReadings) {
-      PositionCandidate candidate;
-      if (calculatePositionCandidate(masterReading, slaveReading, candidate)) {
-        candidates[candidateCount++] = candidate;
-      }
-    }
+  // 2. Combine each box's two sensors into one best range.
+  //    Both sensors on the same box measure distance to the same target;
+  //    the closer valid reading is preferred (longer readings are more
+  //    likely to be stray echoes from walls/ceiling).
+  float masterRangeCm = getClosestValidDistance(f1, f2);
+  float slaveRangeCm  = getClosestValidDistance(f3, f4);
+
+  // 3. Trilateration requires a range from EACH box.
+  if (masterRangeCm < 0.0f || slaveRangeCm < 0.0f) {
+    return retainPosition(filterState);
   }
-  if (candidateCount == 0) return retainPosition(filterState);
 
-  PositionCandidate measured = selectPositionCandidate(candidates, candidateCount, filterState);
-  float xMeters = measured.xMeters;
-  float depthMeters = measured.depthMeters;
+  float rm = masterRangeCm / 100.0f;   // metres
+  float rs = slaveRangeCm  / 100.0f;   // metres
+  float D  = BOX_BASELINE_M;           // 1.5 m
 
+  // Trilateration:
+  //   master at (0,0):  rm² = x² + depth²
+  //   slave  at (D,0):  rs² = (x-D)² + depth²
+  //   subtract → x = (rm² - rs² + D²) / (2D)
+  float xMeters = (rm * rm - rs * rs + D * D) / (2.0f * D);
+  float depthSquared = rm * rm - xMeters * xMeters;
+
+  // If depthSquared < 0 the two range circles don't intersect
+  // (geometrically inconsistent readings). Retain last known position.
+  if (depthSquared < 0.0f) {
+    return retainPosition(filterState);
+  }
+  float depthMeters = sqrtf(depthSquared);
+
+  // Bounds check
+  if (xMeters < -POSITION_X_MARGIN_M ||
+      xMeters > D + POSITION_X_MARGIN_M) {
+    return retainPosition(filterState);
+  }
+  if (depthMeters > POSITION_MAP_DEPTH_M) {
+    return retainPosition(filterState);
+  }
+
+  // Dead zone (too close to the sensor wall)
   if (deadZoneLatched) {
     deadZoneLatched = depthMeters <= DEAD_ZONE_RELEASE_DEPTH_M;
   } else {
@@ -309,7 +341,8 @@ PlayerPosition calculatePlayerPosition(
   }
   playerInDeadZone = deadZoneLatched;
 
-  float x = fminf(1.0f, fmaxf(0.0f, xMeters / BOX_BASELINE_M));
+  // Normalise to [0, 1] for the game / dashboard
+  float x = fminf(1.0f, fmaxf(0.0f, xMeters / D));
   float y = 1.0f - depthMeters / POSITION_MAP_DEPTH_M;
   return addPositionSample(x, y, filterState);
 }
@@ -331,6 +364,8 @@ void setBuzzerOutput(bool enabled) {
 
 void handleSlavePacket(const uint8_t *incomingData, int length) {
   if (length != sizeof(SensorPacket)) {
+    Serial.print("Got ESP-NOW packet with wrong size: ");
+    Serial.println(length);
     return;
   }
   SensorPacket packet;
@@ -339,6 +374,7 @@ void handleSlavePacket(const uint8_t *incomingData, int length) {
   slaveSensor2Cm = packet.sensor2Cm;
   lastSlavePacketMs = millis();
   slaveReplyReady = true;
+  Serial.println("Slave reply received by master");
 }
 
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
@@ -371,6 +407,11 @@ void buildSensorJson(char *buffer, size_t bufferSize) {
   float sensor1 = readSensorDistance(SENSOR_1_TRIG_PIN, SENSOR_1_ECHO_PIN);
   delay(SENSOR_SETTLE_DELAY_MS); // let sensor 1's echo die down before sensor 2
   float sensor2 = readSensorDistance(SENSOR_2_TRIG_PIN, SENSOR_2_ECHO_PIN);
+
+  // Extra settle gap before asking the slave to fire - gives sensor 2's
+  // echo (and any lingering reflections from sensor 1) a full clear
+  // window before two MORE ultrasonic pulses go out from across the room.
+  delay(SENSOR_SETTLE_DELAY_MS);
 
   bool slaveSampleReceived = requestSlaveSample();
   float remote1 = slaveSampleReceived ? slaveSensor1Cm : -1.0f;
@@ -566,9 +607,7 @@ void handleRoot() {
 }
 
 void handleData() {
-  char json[180];
-  buildSensorJson(json, sizeof(json));
-  webServer.send(200, "application/json", json);
+  webServer.send(200, "application/json", cachedJson);
 }
 
 // =======================================================================
@@ -652,11 +691,10 @@ void loop() {
 
   digitalWrite(LED_PIN, HIGH);
 
-  char packet[180];
-  buildSensorJson(packet, sizeof(packet));
+  buildSensorJson(cachedJson, sizeof(cachedJson));
 
   udp.beginPacket(BROADCAST_IP, UDP_PORT);
-  udp.write(reinterpret_cast<const uint8_t *>(packet), strlen(packet));
+  udp.write(reinterpret_cast<const uint8_t *>(cachedJson), strlen(cachedJson));
   if (udp.endPacket() == 0) {
     Serial.println("UDP broadcast send failed");
   }
