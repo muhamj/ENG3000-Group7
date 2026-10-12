@@ -24,6 +24,17 @@
 //   - Sensor angles are NOT treated as exact rays.
 //   - Extensive serial diagnostics are included to help tune the system.
 //
+// SENSOR LAYOUT (45/70 setup):
+//
+//   - Each box has a steep sensor (70 deg from the sensor wall) and a
+//     shallow sensor (45 deg from the sensor wall), both aimed inward.
+//   - Together the two beams of one box cover roughly 30-85 deg, so one
+//     box can see most of the play area.
+//   - Usually only the sensor whose beam the player is standing in reports
+//     a range. If both report, they are averaged, unless they disagree by
+//     more than BOX_PAIR_MAX_DISAGREEMENT_CM. In that case the nearer
+//     reading is used, because the player is normally the nearest object.
+//
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -175,16 +186,39 @@ const float LATERAL_CONFLICT_THRESHOLD = 0.45f;
 // Sensor mounting angles
 // ---------------------------------------------------------------------
 //
-// These are now ONLY diagnostic information.
+// Angles are measured from the sensor wall: 0 = along the wall toward the
+// other box, 90 = straight out into the play area. Each box has one steep
+// and one shallow sensor, both aimed inward.
+//
+//   Steep sensors   (S1 on the master, S3 on the slave): 70 degrees
+//   Shallow sensors (S2 on the master, S4 on the slave): 45 degrees
+//
+// With a beam half-angle of about 15 degrees, one box's two beams cover
+// roughly 55-85 degrees (steep) and 30-60 degrees (shallow), overlapping a
+// little around 55-60. Together they sweep almost the whole play area.
+// Before this change the shallow sensors were at 20 degrees, which mostly
+// looked along the wall at the other box and rarely saw a player.
+//
+// These are still ONLY diagnostic information.
 // They are NOT used as exact geometric rays.
 //
-// They can still be useful when tuning the physical sensor setup.
+// If S1/S3 turn out to be the shallow sensors on the hardware, swap the
+// 70 and 45 values below. Nothing else in this file depends on them.
 //
 
-const float SENSOR_1_ANGLE_DEG = 20.0f;
-const float SENSOR_2_ANGLE_DEG = 70.0f;
-const float SENSOR_3_ANGLE_DEG = 20.0f;
-const float SENSOR_4_ANGLE_DEG = 70.0f;
+const float SENSOR_1_ANGLE_DEG = 70.0f;
+const float SENSOR_2_ANGLE_DEG = 45.0f;
+const float SENSOR_3_ANGLE_DEG = 70.0f;
+const float SENSOR_4_ANGLE_DEG = 45.0f;
+
+// If both sensors in a box report a range but they differ by more than
+// this, they are probably looking at different things (their beams cover
+// different sectors), so averaging them would give a distance where
+// nothing actually is. The nearer reading is used instead.
+//
+// Starting value. Tune it from the grid test. Set it very large (for
+// example 1000) to always average, as before.
+const float BOX_PAIR_MAX_DISAGREEMENT_CM = 25.0f;
 
 // ---------------------------------------------------------------------
 // One-box recovery
@@ -736,9 +770,16 @@ float calculateCombinedLateralSignal(
 // Choose a usable range from one box
 // =====================================================================
 //
-// This is now primarily used by one-box recovery.
+// Used by both normal two-box positioning and one-box recovery.
 //
-// Normal two-box positioning does NOT depend on this.
+// With the 45/70 layout the two sensors in a box cover different sectors,
+// so usually only one of them has the player in its beam:
+//
+//   - only one valid          -> use it
+//   - both valid and close    -> average them (same target, two views)
+//   - both valid, disagree    -> use the nearer one. The player is
+//     normally the nearest object, and the farther echo is more likely
+//     a wall or another object than the player.
 //
 
 float chooseBoxRange(
@@ -767,7 +808,18 @@ float chooseBoxRange(
     return sensorB;
   }
 
-  // Average for depth/recovery.
+  if (
+    fabsf(sensorA - sensorB) >
+    BOX_PAIR_MAX_DISAGREEMENT_CM
+  ) {
+
+    return fminf(
+      sensorA,
+      sensorB
+    );
+  }
+
+  // Close agreement: average for depth/recovery.
   return (
     sensorA +
     sensorB
@@ -1040,8 +1092,7 @@ PlayerPosition calculatePlayerPosition(
   ) {
 
     // ---------------------------------------------------------------
-    // Instead of blindly averaging the pair, use the MEDIAN/average
-    // only as the depth/range representation.
+    // Pick one range per box (see chooseBoxRange for the rules).
     //
     // The lateral difference remains available separately.
     // ---------------------------------------------------------------
@@ -2455,6 +2506,10 @@ void setup() {
 
   Serial.println(
     "Position algorithm: four-sensor lateral-aware trilateration"
+  );
+
+  Serial.println(
+    "Sensor layout: 70 deg (S1, S3) and 45 deg (S2, S4) from the wall"
   );
 
   Serial.println(
