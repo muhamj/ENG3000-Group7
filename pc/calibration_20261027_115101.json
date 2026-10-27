@@ -1,0 +1,296 @@
+{
+  "format": "floor-grid-calibration-v1",
+  "created_at": "2026-10-27T00:51:01.997383+00:00",
+  "grid": {
+    "rows": 3,
+    "columns": 3
+  },
+  "duration_per_square_seconds": 5.0,
+  "coordinate_note": "row 1 is the top row; column 1 is the left column",
+  "cells": [
+    {
+      "row": 1,
+      "column": 1,
+      "samples": [
+        {
+          "elapsed_seconds": 0.0,
+          "sensor1_cm": 52.19,
+          "sensor2_cm": 53.58,
+          "sensor3_cm": null,
+          "sensor4_cm": null,
+          "x": 0.75,
+          "y": 0.442
+        },
+        {
+          "elapsed_seconds": 0.219,
+          "sensor1_cm": 58.46,
+          "sensor2_cm": 56.89,
+          "sensor3_cm": null,
+          "sensor4_cm": null,
+          "x": 0.75,
+          "y": 0.442
+        },
+        {
+          "elapsed_seconds": 0.625,
+          "sensor1_cm": 62.73,
+          "sensor2_cm": 58.05,
+          "sensor3_cm": null,
+          "sensor4_cm": null,
+          "x": 0.75,
+          "y": 0.442
+        },
+        {
+          "elapsed_seconds": 0.828,
+          "sensor1_cm": 66.25,
+          "sensor2_cm": 41.28,
+          "sensor3_cm": null,
+          "sensor4_cm": null,
+          "x": 0.75,
+          "y": 0.442
+        },
+        {
+          "elapsed_seconds": 1.235,
+          "sensor1_cm": 70.49,
+          "sensor2_cm": 65.63,
+          "sensor3_cm": null,
+          "sensor4_cm": null,
+          "x": 0.75,
+          "y": 0.442
+        },
+        {
+          "elapsed_seconds": 1.656,
+          "sensor1_cm": 66.25,
+          "sensor2_cm": 68.22,
+          "sensor3_cm": null,
+          "sensor4_cm": null,
+          "x": 0.75,
+          "y": 0.442
+        },
+        {
+          "elapsed_seconds": 2.078,
+          "sensor1_cm": 66.52,
+          "sensor2_cm": 66.08,
+          "sensor3_cm": null,
+          "sensor4_cm": null,
+          "x": 0.75,
+          "y": 0.442
+        },
+        {
+          "elapsed_seconds": 2.297,
+          "sensor1_cm": 67.93,
+          "sensor2_cm": 65.22,
+          "sensor3_cm": null,
+          "sensor4_cm": null,
+          "x": 0.75,
+          "y": 0.442
+        },
+        {
+          "elapsed_seconds": 2.719,
+          "sensor1_cm": 68.07,
+          "sensor2_cm": 67.35,
+          "sensor3_cm": null,
+          "sensor4_cm": null,
+          "x": 0.75,
+          "y": 0.442
+        },
+        {
+          "elapsed_seconds": 3.36,
+          "sensor1_cm": 57.18,
+          "sensor2_cm": 60.61,
+          "sensor3_cm": null,
+          "sensor4_cm": null,
+          "x": 0.75,
+          "y": 0.442
+        },
+        {
+          "elapsed_seconds": 3.563,
+          "sensor1_cm": 57.33,
+          "sensor2_cm": 71.31,
+          "sensor3_cm": null,
+          "sensor4_cm": null,
+          "x": 0.75,
+          "y": 0.442
+        },
+        {
+          "elapsed_seconds": 4.594,
+          "sensor1_cm": 42.02,
+          "sensor2_cm": null,
+          "sensor3_cm": null,
+          "sensor4_cm": null,
+          "x": 0.75,
+          "y": 0.442
+        },
+        {
+          "elapsed_seconds": 5.0,
+          "sensor1_cm": 43.13,
+          "sensor2_cm": null,
+          "sensor3_cm": null,
+          "sensor4_cm": null,
+          "x": 0.75,
+          "y": 0.442
+        }
+      ]
+    },
+    {
+      "row": 1,
+      "column": 2,
+      "samples": [
+        {
+          "elapsed_seconds": 0.0,
+          "sensor1_cm": 85.54,
+          "sensor2_cm": 89.25,
+          "sensor3_cm": null,
+          "sensor4_cm": null,
+          "x": 0.449,
+          "y": 0.719
+        },
+        {
+          "elapsed_seconds": 0.407,
+          "sensor1_cm": 85.39,
+          "sensor2_cm": 192.99,
+          "sensor3_cm": 99.78,
+          "sensor4_cm": null,
+          "x": 0.446,
+          "y": 0.696
+        },
+        {
+          "elapsed_seconds": 0.829,
+          "sensor1_cm": 87.41,
+          "sensor2_cm": null,
+          "sensor3_cm": 92.68,
+          "sensor4_cm": null,
+          "x": 0.453,
+          "y": 0.71
+        },
+        {
+          "elapsed_seconds": 1.25,
+          "sensor1_cm": null,
+          "sensor2_cm": 91.17,
+          "sensor3_cm": null,
+          "sensor4_cm": null,
+          "x": 0.459,
+          "y": 0.716
+        },
+        {
+          "elapsed_seconds": 1.657,
+          "sensor1_cm": 85.92,
+          "sensor2_cm": 89.04,
+          "sensor3_cm": 96.73,
+          "sensor4_cm": null,
+          "x": 0.457,
+          "y": 0.707
+        },
+        {
+          "elapsed_seconds": 2.297,
+          "sensor1_cm": 85.22,
+          "sensor2_cm": 88.36,
+          "sensor3_cm": null,
+          "sensor4_cm": null,
+          "x": 0.427,
+          "y": 0.704
+        },
+        {
+          "elapsed_seconds": 2.907,
+          "sensor1_cm": 85.48,
+          "sensor2_cm": 85.18,
+          "sensor3_cm": null,
+          "sensor4_cm": null,
+          "x": 0.427,
+          "y": 0.693
+        },
+        {
+          "elapsed_seconds": 3.11,
+          "sensor1_cm": 81.03,
+          "sensor2_cm": 82.68,
+          "sensor3_cm": 86.9,
+          "sensor4_cm": null,
+          "x": 0.432,
+          "y": 0.69
+        },
+        {
+          "elapsed_seconds": 3.329,
+          "sensor1_cm": 76.9,
+          "sensor2_cm": 79.35,
+          "sensor3_cm": 79.35,
+          "sensor4_cm": null,
+          "x": 0.471,
+          "y": 0.743
+        },
+        {
+          "elapsed_seconds": 3.75,
+          "sensor1_cm": 75.72,
+          "sensor2_cm": 60.63,
+          "sensor3_cm": null,
+          "sensor4_cm": null,
+          "x": 0.482,
+          "y": 0.793
+        },
+        {
+          "elapsed_seconds": 4.172,
+          "sensor1_cm": 76.47,
+          "sensor2_cm": 75.51,
+          "sensor3_cm": 80.26,
+          "sensor4_cm": null,
+          "x": 0.474,
+          "y": 0.823
+        },
+        {
+          "elapsed_seconds": 4.594,
+          "sensor1_cm": 74.21,
+          "sensor2_cm": 76.95,
+          "sensor3_cm": 81.17,
+          "sensor4_cm": null,
+          "x": 0.471,
+          "y": 0.858
+        },
+        {
+          "elapsed_seconds": 5.0,
+          "sensor1_cm": 73.76,
+          "sensor2_cm": 75.49,
+          "sensor3_cm": null,
+          "sensor4_cm": null,
+          "x": 0.471,
+          "y": 0.869
+        }
+      ]
+    },
+    {
+      "row": 1,
+      "column": 3,
+      "samples": []
+    },
+    {
+      "row": 2,
+      "column": 1,
+      "samples": []
+    },
+    {
+      "row": 2,
+      "column": 2,
+      "samples": []
+    },
+    {
+      "row": 2,
+      "column": 3,
+      "samples": []
+    },
+    {
+      "row": 3,
+      "column": 1,
+      "samples": []
+    },
+    {
+      "row": 3,
+      "column": 2,
+      "samples": []
+    },
+    {
+      "row": 3,
+      "column": 3,
+      "samples": []
+    }
+  ],
+  "finished_at": "2026-10-27T00:51:22.860032+00:00",
+  "completed_squares": 2,
+  "sample_count": 26
+}

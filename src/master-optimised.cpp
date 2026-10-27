@@ -99,13 +99,15 @@ const unsigned int BUZZER_FREQUENCY_HZ = 2200;
 // Sensor timing
 // ---------------------------------------------------------------------
 
-const unsigned long SENSOR_SETTLE_DELAY_MS = 90;
+const unsigned long SENSOR_SETTLE_DELAY_MS = 40;
 
 // ---------------------------------------------------------------------
 // Position configuration
 // ---------------------------------------------------------------------
 
-const float MAX_TRACKING_DISTANCE_CM = 200.0f;
+// Accept ranges long enough to see the far corners of a 1.5 m x 1.8 m
+// play area (the diagonal is about 2.34 m). pulseIn below allows ~2.74 m.
+const float MAX_TRACKING_DISTANCE_CM = 300.0f;
 
 // Distance between sensor boxes.
 const float BOX_BASELINE_M = 1.5f;
@@ -114,8 +116,8 @@ const float BOX_BASELINE_M = 1.5f;
 const float POSITION_X_MARGIN_M = 0.35f;
 
 // Dead zone near sensor wall.
-const float DEAD_ZONE_DEPTH_M = 0.5f;
-const float DEAD_ZONE_RELEASE_DEPTH_M = 0.55f;
+const float DEAD_ZONE_DEPTH_M = 0.10f;
+const float DEAD_ZONE_RELEASE_DEPTH_M = 0.15f;
 
 // Depth represented by graph.
 const float POSITION_MAP_DEPTH_M = 1.8f;
@@ -206,8 +208,8 @@ const float LATERAL_CONFLICT_THRESHOLD = 0.45f;
 // 70 and 45 values below. Nothing else in this file depends on them.
 //
 
-const float SENSOR_1_ANGLE_DEG = 70.0f;
-const float SENSOR_2_ANGLE_DEG = 45.0f;
+const float SENSOR_1_ANGLE_DEG = 45.0f;
+const float SENSOR_2_ANGLE_DEG = 70.0f;
 const float SENSOR_3_ANGLE_DEG = 70.0f;
 const float SENSOR_4_ANGLE_DEG = 45.0f;
 
@@ -254,7 +256,7 @@ float readSensorDistance(int trigPin, int echoPin) {
   long duration = pulseIn(
     echoPin,
     HIGH,
-    16000
+    20000
   );
 
   Serial.print("  [raw] trig=");
@@ -2160,9 +2162,13 @@ function drawPosition(x, y) {
     canvas.height
   );
 
-  const deadZoneDepth = 0.6;
+  const deadZoneDepth = 0.10;
 
   const totalDepth = 1.8;
+
+  const row1End = 0.6;
+
+  const row2End = 1.0;
 
   const depthToY =
     depth =>
@@ -2217,7 +2223,7 @@ function drawPosition(x, y) {
 
   for (
     const depth
-    of [1.0, 1.4]
+    of [row1End, row2End]
   ) {
 
     const rowY =
@@ -2269,7 +2275,7 @@ function drawPosition(x, y) {
     "14px Consolas, monospace";
 
   ctx.fillText(
-    "60 cm DEAD ZONE",
+    "10 cm DEAD ZONE",
     12,
     playAreaBottom +
       (canvas.height -
@@ -2280,21 +2286,21 @@ function drawPosition(x, y) {
   ctx.fillStyle = "#9eacb8";
 
   ctx.fillText(
-    "ROW 3: 140-180 cm",
+    "FAR ROW: " + row2End.toFixed(1) + "-180 cm",
     12,
-    depthToY(1.6) + 5
+    depthToY((row2End + totalDepth) / 2) + 5
   );
 
   ctx.fillText(
-    "ROW 2: 100-140 cm",
+    "MIDDLE ROW: " + row1End.toFixed(1) + "-" + row2End.toFixed(1) + " cm",
     12,
-    depthToY(1.2) + 5
+    depthToY((row1End + row2End) / 2) + 5
   );
 
   ctx.fillText(
-    "ROW 1: 60-100 cm",
+    "NEAR ROW: 10-" + row1End.toFixed(1) + " cm",
     12,
-    depthToY(0.8) + 5
+    depthToY((deadZoneDepth + row1End) / 2) + 5
   );
 
   if (
