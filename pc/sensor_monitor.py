@@ -4,6 +4,8 @@ This is a standalone diagnostic tool, separate from the actual game
 (game_wifi.py). It listens for the same UDP packets the game reads, prints
 a live terminal dashboard, and also serves a simple HTML dashboard at
 http://localhost:8000/ (see website.html, which must sit next to this file).
+
+Updated for 6-sensor setup: sensor1-sensor6, support, deadZone fields.
 """
 
 import argparse
@@ -21,8 +23,12 @@ def parse_packet(data):
 		packet = json.loads(data.decode("utf-8"))
 		if not isinstance(packet, dict) or not packet.get("mac"):
 			return None
-		for key in ("sensor1", "sensor2", "sensor3", "sensor4", "closest"):
-			value = float(packet[key])
+		for key in ("sensor1", "sensor2", "sensor3", "sensor4", "sensor5", "sensor6", "closest"):
+			try:
+				value = float(packet[key])
+			except (KeyError, TypeError, ValueError):
+				packet[key] = None
+				continue
 			if value < 0:
 				packet[key] = None
 			else:
@@ -34,6 +40,16 @@ def parse_packet(data):
 				packet[key] = None
 			else:
 				packet[key] = value if 0.0 <= value <= 1.0 else None
+		for key in ("support",):
+			try:
+				packet[key] = int(packet[key])
+			except (KeyError, TypeError, ValueError):
+				packet[key] = None
+		for key in ("deadZone",):
+			try:
+				packet[key] = bool(packet[key])
+			except (KeyError, TypeError, ValueError):
+				packet[key] = None
 		return packet
 	except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError):
 		return None
@@ -44,30 +60,37 @@ def format_distance(value):
 
 
 def print_dashboard(packets):
-	print("ESP32 wireless sensor readings")
+	print("ESP32 wireless sensor readings (6-sensor setup)")
 	print(datetime.now().strftime("Updated: %Y-%m-%d %H:%M:%S"))
-	print("ESP32-1 is the Wi-Fi master; ESP32-2 sends its readings over ESP-NOW.")
-	print("-" * 116)
+	print("Master reads S1-S3 locally; S4-S6 arrive from slave via ESP-NOW.")
+	print("-" * 140)
 	print(
 		f"{'Master MAC':20} {'IP address':16} "
-		f"{'S1 (cm)':12} {'S2 (cm)':12} {'S3 (cm)':12} {'S4 (cm)':12} "
-		f"{'Closest':12} {'Status':8}"
+		f"{'S1 (cm)':9} {'S2 (cm)':9} {'S3 (cm)':9} "
+		f"{'S4 (cm)':9} {'S5 (cm)':9} {'S6 (cm)':9} "
+		f"{'Closest':9} {'X':6} {'Y':6} {'Sup':4} {'Status':8}"
 	)
-	print("-" * 116)
+	print("-" * 140)
 	for mac, packet in sorted(packets.items()):
 		age = datetime.now().timestamp() - packet["received_at"]
 		status = "online" if age < 5 else f"{age:.0f}s ago"
+		x_str = f"{packet['x']:.3f}" if packet.get('x') is not None else "--"
+		y_str = f"{packet['y']:.3f}" if packet.get('y') is not None else "--"
+		sup_str = str(packet.get('support', '--')) if packet.get('support') is not None else "--"
 		print(
 			f"{mac:20} {packet['address']:16} "
-			f"{format_distance(packet['sensor1']):12} "
-			f"{format_distance(packet['sensor2']):12} "
-			f"{format_distance(packet['sensor3']):12} "
-			f"{format_distance(packet['sensor4']):12} "
-			f"{format_distance(packet['closest']):12} {status:8}"
+			f"{format_distance(packet.get('sensor1')):9} "
+			f"{format_distance(packet.get('sensor2')):9} "
+			f"{format_distance(packet.get('sensor3')):9} "
+			f"{format_distance(packet.get('sensor4')):9} "
+			f"{format_distance(packet.get('sensor5')):9} "
+			f"{format_distance(packet.get('sensor6')):9} "
+			f"{format_distance(packet.get('closest')):9} "
+			f"{x_str:6} {y_str:6} {sup_str:4} {status:8}"
 		)
 	if not packets:
 		print("Waiting for packets from the ESP32 boards...")
-	print("-" * 116)
+	print("-" * 140)
 	print("Press Ctrl+C to stop.")
 
 

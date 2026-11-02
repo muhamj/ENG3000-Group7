@@ -6,8 +6,8 @@
     "organization": null,
     "repositoryId": null,
     "repositoryName": null,
-    "createdAt": "2026-10-04T03:16:02.196Z",
-    "updatedAt": "2026-10-04T03:16:02.196Z",
+    "createdAt": "2026-11-02T18:30:21.158Z",
+    "updatedAt": "2026-11-02T18:30:21.158Z",
     "languages": [
       "CPP",
       "HTML",
@@ -1882,11 +1882,14 @@
         {
           "patternId": "Lizard_file-nloc-medium",
           "parameters": {
-            "threshold": "650"
+            "threshold": "890"
           }
         },
         {
-          "patternId": "Lizard_nloc-medium"
+          "patternId": "Lizard_nloc-medium",
+          "parameters": {
+            "threshold": "60"
+          }
         },
         {
           "patternId": "Lizard_parameter-count-medium"
@@ -1894,7 +1897,7 @@
         {
           "patternId": "Lizard_nloc-critical",
           "parameters": {
-            "threshold": "320"
+            "threshold": "290"
           }
         },
         {
@@ -1904,7 +1907,10 @@
           }
         },
         {
-          "patternId": "Lizard_ccn-medium"
+          "patternId": "Lizard_ccn-medium",
+          "parameters": {
+            "threshold": "18"
+          }
         },
         {
           "patternId": "Lizard_parameter-count-critical"

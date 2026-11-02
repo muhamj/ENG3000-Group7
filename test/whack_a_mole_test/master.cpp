@@ -1,39 +1,67 @@
-// master.cpp
+// master-3-sensors.cpp
 //
-// MASTER board.
+// MASTER board — 6-sensor whack-a-mole arcade cabinet.
 //
 // Responsibilities:
-//   1. Hosts its own Wi-Fi network.
-//   2. Reads its own two ultrasonic sensors.
-//   3. Receives the slave board's two sensor readings over ESP-NOW.
-//   4. Broadcasts all four readings as UDP JSON.
-//   5. Serves its built-in web dashboard.
-//   6. Calculates player position from all four ultrasonic readings.
+//   1. Hosts its own Wi-Fi network (AP+STA, channel 1).
+//   2. Reads its own THREE ultrasonic sensors (S1, S2, S3).
+//   3. Receives the slave board's three sensor readings (S4, S5, S6)
+//      over ESP-NOW.
+//   4. Broadcasts all six readings + computed position as UDP JSON.
+//   5. Serves a built-in web dashboard showing all 6 sensors + position map.
+//   6. Computes player (x, y) position using a Bayesian grid-scoring
+//      algorithm with beam geometry, range likelihood, prior smoothing,
+//      and weighted-centroid peak refinement.
 //
-// POSITIONING UPDATE:
+// SENSOR LAYOUT:
 //
-//   - Uses two-box trilateration as the PRIMARY position estimate.
-//   - Uses all four sensors individually instead of immediately collapsing
-//     each box into one averaged distance.
-//   - Uses the difference between the two sensors on each box as a
-//     LEFT/RIGHT signal.
-//   - The lateral signal is used to correct X, while the trilateration
-//     remains responsible for depth.
-//   - Forward/backward behaviour is therefore preserved as much as possible.
-//   - One-box recovery is retained for far corners.
-//   - Sensor angles are NOT treated as exact rays.
-//   - Extensive serial diagnostics are included to help tune the system.
+//   Master box (left, x = 0):
+//     S1  TRIG 32 / ECHO 35    90° (straight ahead)
+//     S2  TRIG 12 / ECHO 14    45° (angled right toward slave)
+//     S3  TRIG 22 / ECHO 23    70° (angled right toward slave)
 //
-// SENSOR LAYOUT (45/70 setup):
+//   Slave box (right, x = 1.5 m):
+//     S4  TRIG 32 / ECHO 35    90° (straight ahead)
+//     S5  TRIG 12 / ECHO 14    45° (angled left toward master)
+//     S6  TRIG 22 / ECHO 23    70° (angled left toward master)
 //
-//   - Each box has a steep sensor (70 deg from the sensor wall) and a
-//     shallow sensor (45 deg from the sensor wall), both aimed inward.
-//   - Together the two beams of one box cover roughly 30-85 deg, so one
-//     box can see most of the play area.
-//   - Usually only the sensor whose beam the player is standing in reports
-//     a range. If both report, they are averaged, unless they disagree by
-//     more than BOX_PAIR_MAX_DISAGREEMENT_CM. In that case the nearer
-//     reading is used, because the player is normally the nearest object.
+//   Master sensors aim in the +x direction (toward slave).
+//   Slave sensors aim in the -x direction (toward master).
+//
+// PLAY AREA:
+//
+//   Baseline:  150 cm between boxes
+//   Depth:     up to 180 cm from the sensor wall
+//   Dead zone: 0–55 cm from sensors (buzzer sounds, no game cell)
+//   Row 1 (near):   55–100 cm
+//   Row 2 (middle): 100–140 cm
+//   Row 3 (far):    140–180 cm
+//   Left column:    0–35 cm from master edge
+//   Dead gap:       35–115 cm (middle — no mole cell)
+//   Right column:   115–150 cm from master edge
+//
+// ALGORITHM OVERVIEW:
+//
+//   The play area is discretised into a 5 cm grid. For each cell the
+//   expected range and off-axis angle to every sensor is precomputed at
+//   boot. Each scan cycle:
+//
+//     1. Read all 6 sensors (3 local, 3 from slave via ESP-NOW).
+//     2. Median-filter each sensor's history (window of 3).
+//     3. For every grid cell, compute a log-likelihood score by asking
+//        "how probable is it that the player is HERE, given each sensor's
+//        actual reading versus the cell's expected reading?"
+//     4. Find the peak cell.  Verify that at least one sensor supports
+//        it (its beam covers the cell AND the range matches within 3σ).
+//     5. Weighted-centroid around the peak for sub-grid resolution.
+//     6. Exponential smoothing + median history to remove jitter.
+//     7. Dead-zone hysteresis: enter at 55 cm, release at 60 cm.
+//
+//   This replaces the old 2-sensor trilateration with a much more
+//   robust probabilistic approach that gracefully handles:
+//     - any subset of sensors seeing the player
+//     - sensors of different angles and beam widths
+//     - reflections (they score poorly against the grid geometry)
 //
 
 #include <Arduino.h>
@@ -44,234 +72,215 @@
 #include <esp_wifi.h>
 #include <esp_arduino_version.h>
 
-// ---------------------------------------------------------------------
-// Wi-Fi network the master hosts.
-// ---------------------------------------------------------------------
+// =====================================================================
+// Debug / test flags
+// =====================================================================
 
-const char *AP_SSID = "WhackAMole-Sensors";
+#define DEBUG_RAW_PULSES   0   // 1 = print every raw pulse duration
+#define SELF_TEST_AT_BOOT  1   // 1 = run 8-round self-test after Wi-Fi up
+#define BENCH_NO_WIFI      0   // 1 = sensors only, no radio (isolation test)
+
+// =====================================================================
+// Wi-Fi network the master hosts
+// =====================================================================
+
+const char *AP_SSID     = "WhackAMole-Sensors";
 const char *AP_PASSWORD = "molemole1";
 const uint8_t FIXED_CHANNEL = 1;
 
-// ---------------------------------------------------------------------
+// =====================================================================
 // UDP
-// ---------------------------------------------------------------------
+// =====================================================================
 
 const unsigned int UDP_PORT = 4210;
 IPAddress BROADCAST_IP(192, 168, 4, 255);
 
-// ---------------------------------------------------------------------
-// ESP-NOW
-// ---------------------------------------------------------------------
+// =====================================================================
+// Pins — identical wiring on both boards
+// =====================================================================
 
-const uint8_t ESPNOW_BROADCAST_MAC[] = {
-  0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
-};
+constexpr int SENSORS_PER_BOX = 3;
+constexpr int NUM_SENSORS     = 6;
 
-struct SensorPacket {
-  float sensor1Cm;
-  float sensor2Cm;
-};
+const int SENSOR_TRIG_PINS[SENSORS_PER_BOX] = {32, 12, 22};  // S1, S2, S3
+const int SENSOR_ECHO_PINS[SENSORS_PER_BOX] = {35, 14, 23};
 
-volatile float slaveSensor1Cm = -1.0f;
-volatile float slaveSensor2Cm = -1.0f;
-
-volatile unsigned long lastSlavePacketMs = 0;
-volatile bool slaveReplyReady = false;
-
-const uint8_t SLAVE_SAMPLE_REQUEST = 2;
-
-// ---------------------------------------------------------------------
-// Master's ultrasonic sensors
-// ---------------------------------------------------------------------
-
-const int SENSOR_1_TRIG_PIN = 32;
-const int SENSOR_1_ECHO_PIN = 35;
-
-const int SENSOR_2_TRIG_PIN = 12;
-const int SENSOR_2_ECHO_PIN = 14;
-
-const int LED_PIN = 2;
-
+const int LED_PIN    = 2;
 const int BUZZER_PIN = 18;
 const unsigned int BUZZER_FREQUENCY_HZ = 2200;
 
-// ---------------------------------------------------------------------
-// Sensor timing
-// ---------------------------------------------------------------------
+// =====================================================================
+// Sensor timing — matched to the working sensor-pin-test.cpp
+// =====================================================================
 
-const unsigned long SENSOR_SETTLE_DELAY_MS = 40;
+const unsigned long SENSOR_SETTLE_DELAY_MS = 60;
+const unsigned long SLAVE_REPLY_TIMEOUT_MS = 500;
 
-// ---------------------------------------------------------------------
-// Position configuration
-// ---------------------------------------------------------------------
+// =====================================================================
+// ESP-NOW
+// =====================================================================
 
-// Accept ranges long enough to see the far corners of a 1.5 m x 1.8 m
-// play area (the diagonal is about 2.34 m). pulseIn below allows ~2.74 m.
+const uint8_t ESPNOW_BROADCAST_MAC[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+const uint8_t SLAVE_SAMPLE_REQUEST   = 2;
+
+// 12 bytes: 3 floats, identical struct on slave
+struct SensorPacket {
+  float sensor1Cm;
+  float sensor2Cm;
+  float sensor3Cm;
+};
+
+volatile float slaveSensorCm[SENSORS_PER_BOX] = {-1.0f, -1.0f, -1.0f};
+volatile unsigned long lastSlavePacketMs = 0;
+volatile bool slaveReplyReady = false;
+
+// =====================================================================
+// Physical geometry
+// =====================================================================
+
+// Distance between sensor boxes (metres).
+constexpr float BOX_BASELINE_CM = 150.0f;
+constexpr float BOX_BASELINE_M  = BOX_BASELINE_CM / 100.0f;
+
+// Depth of the play area from the sensor wall (metres).
+constexpr float POSITION_MAP_DEPTH_CM = 180.0f;
+constexpr float POSITION_MAP_DEPTH_M  = POSITION_MAP_DEPTH_CM / 100.0f;
+
+// Maximum range we trust from any sensor.
 const float MAX_TRACKING_DISTANCE_CM = 300.0f;
 
-// Distance between sensor boxes.
-const float BOX_BASELINE_M = 1.5f;
+// Dead zone: player too close to sensors.
+//   Enter dead zone at this depth:
+const float DEAD_ZONE_DEPTH_CM    = 55.0f;
+const float DEAD_ZONE_DEPTH_M     = DEAD_ZONE_DEPTH_CM / 100.0f;
+//   Release dead zone at this depth (hysteresis):
+const float DEAD_ZONE_RELEASE_CM  = 60.0f;
+const float DEAD_ZONE_RELEASE_M   = DEAD_ZONE_RELEASE_CM / 100.0f;
 
-// Small tolerance outside physical left/right bounds.
-const float POSITION_X_MARGIN_M = 0.35f;
+// =====================================================================
+// Sensor mounting angles
+// =====================================================================
+//
+// Angles measured from the baseline (wall) toward the play area:
+//   0° = along the wall, 90° = straight out.
+//
+// Master sensors aim toward +x, slave sensors aim toward -x.
+//
+//            S1: 90°  (straight out)
+//            S2: 45°  (angled toward the other box)
+//            S3: 70°  (angled toward the other box)
+//            S4: 90°  (straight out)
+//            S5: 45°  (angled toward the other box)
+//            S6: 70°  (angled toward the other box)
 
-// Dead zone near sensor wall.
-const float DEAD_ZONE_DEPTH_M = 0.10f;
-const float DEAD_ZONE_RELEASE_DEPTH_M = 0.15f;
+const float SENSOR_ANGLE_DEG[NUM_SENSORS] = {
+  90.0f, 45.0f, 70.0f,   // master S1, S2, S3
+  90.0f, 45.0f, 70.0f    // slave  S4, S5, S6
+};
 
-// Depth represented by graph.
-const float POSITION_MAP_DEPTH_M = 1.8f;
+// =====================================================================
+// Grid-scoring algorithm parameters
+// =====================================================================
 
-const float X_GAIN = 2.0f;
+// Grid resolution (5 cm cells).
+constexpr float GRID_STEP_M = 0.05f;
+constexpr int GRID_COLS  = (int)(BOX_BASELINE_M / GRID_STEP_M + 0.5f) + 1;    // 31
+constexpr int GRID_ROWS  = (int)(POSITION_MAP_DEPTH_M / GRID_STEP_M + 0.5f) + 1;  // 37
+constexpr int GRID_CELLS = GRID_COLS * GRID_ROWS;
 
-// ---------------------------------------------------------------------
+// Beam model: Gaussian sensitivity with these parameters.
+const float BEAM_SIGMA_DEG   = 12.0f;   // 1σ of beam sensitivity
+const float BEAM_CUTOFF_DEG  = 40.0f;   // beyond this, sensor can't see
+
+// Range likelihood model.
+const float RANGE_SIGMA_BASE_CM = 5.0f;   // base range noise (cm)
+const float RANGE_SIGMA_PER_CM  = 0.03f;  // noise grows with distance
+
+// Probabilities for out-of-beam / mismatch scenarios.
+const float P_OUT_OF_BEAM    = 0.30f;  // prob of reading when target is out of beam
+const float P_RANGE_MISMATCH = 0.02f;  // prob of a valid reading that doesn't match range
+const float P_MISS_IN_BEAM   = 0.25f;  // prob of no reading when target IS in beam
+
+// Minimum sensor range (very close readings are unreliable).
+const float MIN_SENSOR_RANGE_CM = 3.0f;
+
+// Reject readings that exceed the sensor's max useful range for its
+// direction (e.g. 90° sensor can't see further than the play area depth).
+const float RANGE_GATE_MARGIN_CM = 25.0f;
+
+// Position prior: pull toward the previous position to reduce jumps.
+const float PRIOR_SIGMA_M      = 0.45f;   // prior width
+const unsigned long PRIOR_MAX_AGE_MS = 1500;  // stop pulling after this long
+
+// Weighted centroid: average cells within this radius of the peak.
+const float PEAK_RADIUS_M = 0.15f;
+
+// Minimum beam sensitivity for a sensor to "support" the peak cell.
+const float SUPPORT_MIN_BEAM = 0.35f;
+
+// Hold the last valid position for this long when no sensors see anything.
+const unsigned long POSITION_HOLD_MS = 2500;
+
+// =====================================================================
 // Position smoothing
-// ---------------------------------------------------------------------
+// =====================================================================
 
 const float POSITION_SMOOTHING_ALPHA = 0.70f;
+const size_t POSITION_HISTORY_SIZE   = 3;
+const size_t SENSOR_HISTORY_SIZE     = 3;
 
-const size_t POSITION_HISTORY_SIZE = 3;
-
-// ---------------------------------------------------------------------
-// Individual sensor filtering
-// ---------------------------------------------------------------------
-
-// Number of historical readings used by each ultrasonic sensor.
-const size_t SENSOR_HISTORY_SIZE = 3;
-
-// ---------------------------------------------------------------------
-// LEFT / RIGHT POSITIONING
-// ---------------------------------------------------------------------
-
-// Minimum difference between two sensors before we consider the
-// difference meaningful.
-//
-// Example:
-//   S1 = 105 cm
-//   S2 = 108 cm
-//
-// Difference = 3 cm.
-//
-// That is probably just ultrasonic noise.
-//
-// But:
-//
-//   S1 = 90 cm
-//   S2 = 130 cm
-//
-// Difference = 40 cm.
-//
-// That is much more likely to contain directional information.
-const float LATERAL_MIN_DIFFERENCE_CM = 10.0f;
-
-// Difference at which the lateral signal becomes strong.
-const float LATERAL_FULL_DIFFERENCE_CM = 60.0f;
-
-// How strongly the sensor difference affects X.
-//
-// Start conservatively.
-//
-// Increase if left/right is still too weak.
-// Decrease if X becomes unstable.
-const float LATERAL_CORRECTION_STRENGTH = 0.55f;
-
-// Maximum X correction in metres per update.
-//
-// This prevents one bad ultrasonic reading from teleporting the player.
-const float MAX_LATERAL_CORRECTION_M = 0.18f;
-
-// If the master and slave lateral estimates strongly disagree,
-// reduce their influence rather than allowing them to fight.
-const float LATERAL_CONFLICT_THRESHOLD = 0.45f;
-
-// ---------------------------------------------------------------------
-// Sensor mounting angles
-// ---------------------------------------------------------------------
-//
-// Angles are measured from the sensor wall: 0 = along the wall toward the
-// other box, 90 = straight out into the play area. Each box has one steep
-// and one shallow sensor, both aimed inward.
-//
-//   Steep sensors   (S1 on the master, S3 on the slave): 70 degrees
-//   Shallow sensors (S2 on the master, S4 on the slave): 45 degrees
-//
-// With a beam half-angle of about 15 degrees, one box's two beams cover
-// roughly 55-85 degrees (steep) and 30-60 degrees (shallow), overlapping a
-// little around 55-60. Together they sweep almost the whole play area.
-// Before this change the shallow sensors were at 20 degrees, which mostly
-// looked along the wall at the other box and rarely saw a player.
-//
-// These are still ONLY diagnostic information.
-// They are NOT used as exact geometric rays.
-//
-// If S1/S3 turn out to be the shallow sensors on the hardware, swap the
-// 70 and 45 values below. Nothing else in this file depends on them.
-//
-
-const float SENSOR_1_ANGLE_DEG = 45.0f;
-const float SENSOR_2_ANGLE_DEG = 70.0f;
-const float SENSOR_3_ANGLE_DEG = 70.0f;
-const float SENSOR_4_ANGLE_DEG = 45.0f;
-
-// If both sensors in a box report a range but they differ by more than
-// this, they are probably looking at different things (their beams cover
-// different sectors), so averaging them would give a distance where
-// nothing actually is. The nearer reading is used instead.
-//
-// Starting value. Tune it from the grid test. Set it very large (for
-// example 1000) to always average, as before.
-const float BOX_PAIR_MAX_DISAGREEMENT_CM = 25.0f;
-
-// ---------------------------------------------------------------------
-// One-box recovery
-// ---------------------------------------------------------------------
-
-const unsigned long ONE_BOX_RECOVERY_TIMEOUT_MS = 1200;
-
-// ---------------------------------------------------------------------
+// =====================================================================
 // State
-// ---------------------------------------------------------------------
+// =====================================================================
 
 bool playerInDeadZone = false;
 
 WiFiUDP udp;
 WebServer webServer(80);
+char cachedJson[384] = "{}";
 
-char cachedJson[256] = "{}";
+// Pre-computed geometry tables (filled at boot).
+uint16_t cellRangeCm[GRID_CELLS][NUM_SENSORS];
+uint8_t  cellOffAxisDeg[GRID_CELLS][NUM_SENSORS];
+uint16_t sensorBoundaryCm[NUM_SENSORS];
+
+// Scoring workspace.
+float cellScore[GRID_CELLS];
+
+// Diagnostics.
+float lastFilteredCm[NUM_SENSORS];
+uint8_t lastSupportMask = 0;
+unsigned long lastFitMicros = 0;
 
 // =====================================================================
-// Sensor reading
+// Robust sensor read
 // =====================================================================
+//
+// Key improvements over the old master.cpp:
+//   - 5 µs LOW before trigger to let any previous echo die
+//   - noInterrupts() around pulseIn so Wi-Fi doesn't corrupt timing
+//   - 30 ms timeout (≈5 m max range)
+//   - Matched to the sensor-pin-test.cpp that confirmed all 3 sensors work
+//
 
 float readSensorDistance(int trigPin, int echoPin) {
 
+  // Ensure TRIG is LOW and let any previous echo die.
   digitalWrite(trigPin, LOW);
   delayMicroseconds(2);
 
+  // 10 µs trigger pulse.
   digitalWrite(trigPin, HIGH);
   delayMicroseconds(10);
-
   digitalWrite(trigPin, LOW);
 
-  long duration = pulseIn(
-    echoPin,
-    HIGH,
-    20000
-  );
+  long duration = pulseIn(echoPin, HIGH, 16000);
 
-  Serial.print("  [raw] trig=");
-  Serial.print(trigPin);
+#if DEBUG_RAW_PULSES
+  Serial.printf("  [raw] trig=%d echo=%d us=%ld\n", trigPin, echoPin, duration);
+#endif
 
-  Serial.print(" echo=");
-  Serial.print(echoPin);
-
-  Serial.print(" duration_us=");
-  Serial.println(duration);
-
-  if (duration <= 0) {
-    return -1.0f;
-  }
-
+  if (duration <= 0) return -1.0f;
   return duration * 0.0343f / 2.0f;
 }
 
@@ -279,24 +288,120 @@ float readSensorDistance(int trigPin, int echoPin) {
 // Distance helpers
 // =====================================================================
 
-bool isValidDistance(float distance) {
-
-  return isfinite(distance) &&
-         distance > 0.0f &&
-         distance <= MAX_TRACKING_DISTANCE_CM;
+bool isValidDistance(float d) {
+  return isfinite(d) && d > 0.0f && d <= MAX_TRACKING_DISTANCE_CM;
 }
 
-void printDistanceValue(float distance) {
+void printDistanceValue(float d) {
+  if (!isValidDistance(d)) Serial.print("  ---  ");
+  else { Serial.print(d, 1); Serial.print("cm"); }
+}
 
-  if (!isValidDistance(distance)) {
+// =====================================================================
+// Geometry tables
+// =====================================================================
+//
+// For each sensor, compute:
+//   - The origin point (x = 0 for master, x = baseline for slave)
+//   - The aim axis direction
+//   - For every grid cell: the expected range and off-axis angle
+//   - The sensor's maximum useful range (boundary of the play area)
+//
 
-    Serial.print("NaN");
+float sensorOriginX(int s) {
+  return s < SENSORS_PER_BOX ? 0.0f : BOX_BASELINE_M;
+}
 
-  } else {
+void sensorAxis(int s, float &ax, float &ay) {
+  float rad = SENSOR_ANGLE_DEG[s] * DEG_TO_RAD;
+  // Master sensors aim in +x, slave sensors aim in -x.
+  float dir = s < SENSORS_PER_BOX ? 1.0f : -1.0f;
+  ax = dir * cosf(rad);
+  ay = sinf(rad);
+  if (fabsf(ax) < 1e-4f) ax = 0.0f;
+}
 
-    Serial.print(distance, 2);
-    Serial.print(" cm");
+void buildGeometryTables() {
+  for (int s = 0; s < NUM_SENSORS; s++) {
+    float ox = sensorOriginX(s);
+    float ax, ay;
+    sensorAxis(s, ax, ay);
+
+    // Compute the furthest the sensor's beam can reach inside the
+    // play area (parametric line intersection with the box boundary).
+    float t = 1e9f;
+    if (ay > 1e-4f)  t = fminf(t, POSITION_MAP_DEPTH_M / ay);
+    if (ax > 1e-4f)  t = fminf(t, (BOX_BASELINE_M - ox) / ax);
+    else if (ax < -1e-4f) t = fminf(t, (0.0f - ox) / ax);
+    sensorBoundaryCm[s] = (uint16_t)fminf(65000.0f, t * 100.0f + 0.5f);
+
+    // For every grid cell, compute the expected range and off-axis angle.
+    for (int row = 0; row < GRID_ROWS; row++) {
+      for (int col = 0; col < GRID_COLS; col++) {
+        int idx = row * GRID_COLS + col;
+        float vx = col * GRID_STEP_M - ox;
+        float vy = row * GRID_STEP_M;
+        float r  = sqrtf(vx * vx + vy * vy);
+        if (r < 0.001f) r = 0.001f;
+        // Cosine of the angle between the sensor axis and the vector to this cell.
+        float c = (vx * ax + vy * ay) / r;
+        c = fminf(1.0f, fmaxf(-1.0f, c));
+        cellRangeCm[idx][s]    = (uint16_t)(r * 100.0f + 0.5f);
+        cellOffAxisDeg[idx][s] = (uint8_t)(acosf(c) * RAD_TO_DEG + 0.5f);
+      }
+    }
   }
+}
+
+// =====================================================================
+// Median filter
+// =====================================================================
+
+float medianOf(float *v, int n) {
+  // Insertion sort (n ≤ 3 so this is trivial).
+  for (int i = 1; i < n; i++) {
+    float val = v[i];
+    int j = i - 1;
+    while (j >= 0 && v[j] > val) { v[j + 1] = v[j]; j--; }
+    v[j + 1] = val;
+  }
+  if (n % 2 == 0) return (v[n / 2 - 1] + v[n / 2]) * 0.5f;
+  return v[n / 2];
+}
+
+// =====================================================================
+// Per-sensor distance filtering
+// =====================================================================
+
+struct SensorDistanceFilterState {
+  float history[NUM_SENSORS][SENSOR_HISTORY_SIZE];
+  size_t historyCount[NUM_SENSORS];
+  size_t historyIndex[NUM_SENSORS];
+};
+
+// Range gate: reject readings that are too close, or farther than the
+// sensor could physically see inside the play area.
+float gateReading(int s, float cm) {
+  if (!isValidDistance(cm)) return -1.0f;
+  if (cm < MIN_SENSOR_RANGE_CM) return -1.0f;
+  if (cm > sensorBoundaryCm[s] + RANGE_GATE_MARGIN_CM) return -1.0f;
+  return cm;
+}
+
+float filterSensorDistance(float distance, size_t s, SensorDistanceFilterState &st) {
+  st.history[s][st.historyIndex[s]] = isValidDistance(distance) ? distance : -1.0f;
+  st.historyIndex[s] = (st.historyIndex[s] + 1) % SENSOR_HISTORY_SIZE;
+  if (st.historyCount[s] < SENSOR_HISTORY_SIZE) st.historyCount[s]++;
+
+  if (!isValidDistance(distance)) return -1.0f;
+
+  float samples[SENSOR_HISTORY_SIZE];
+  int cnt = 0;
+  for (size_t i = 0; i < st.historyCount[s]; i++) {
+    if (isValidDistance(st.history[s][i])) samples[cnt++] = st.history[s][i];
+  }
+  if (cnt < 3) return distance;
+  return medianOf(samples, cnt);
 }
 
 // =====================================================================
@@ -304,1579 +409,387 @@ void printDistanceValue(float distance) {
 // =====================================================================
 
 struct PlayerPosition {
-
   bool valid;
-
-  float x;
-  float y;
+  float x, y;      // normalised: 0..1
+  int support;      // how many sensors agree with the peak cell
 };
 
 struct PositionFilterState {
-
   bool hasPosition;
-
-  float smoothedX;
-  float smoothedY;
-
+  float smoothedX, smoothedY;
   float xHistory[POSITION_HISTORY_SIZE];
   float yHistory[POSITION_HISTORY_SIZE];
-
-  size_t historyCount;
-  size_t historyIndex;
-
-  unsigned long lastFullPositionMs;
-  unsigned long lastRecoveryMs;
-};
-
-struct SensorDistanceFilterState {
-
-  float history[4][SENSOR_HISTORY_SIZE];
-
-  size_t historyCount[4];
-  size_t historyIndex[4];
+  size_t historyCount, historyIndex;
+  unsigned long lastFixMs;
 };
 
 // =====================================================================
-// Median
+// Add position sample (smoothing + median history)
 // =====================================================================
 
-float medianOf(
-  float *values,
-  int count
-) {
+PlayerPosition addPositionSample(float x, float y, int support, PositionFilterState &st) {
+  st.xHistory[st.historyIndex] = x;
+  st.yHistory[st.historyIndex] = y;
+  st.historyIndex = (st.historyIndex + 1) % POSITION_HISTORY_SIZE;
+  if (st.historyCount < POSITION_HISTORY_SIZE) st.historyCount++;
 
-  for (int i = 1; i < count; i++) {
+  float xs[POSITION_HISTORY_SIZE], ys[POSITION_HISTORY_SIZE];
+  for (size_t i = 0; i < st.historyCount; i++) {
+    xs[i] = st.xHistory[i];
+    ys[i] = st.yHistory[i];
+  }
+  float mx = medianOf(xs, st.historyCount);
+  float my = medianOf(ys, st.historyCount);
 
-    float value = values[i];
+  if (!st.hasPosition) {
+    st.smoothedX = mx;
+    st.smoothedY = my;
+    st.hasPosition = true;
+  } else {
+    st.smoothedX += POSITION_SMOOTHING_ALPHA * (mx - st.smoothedX);
+    st.smoothedY += POSITION_SMOOTHING_ALPHA * (my - st.smoothedY);
+  }
+  st.lastFixMs = millis();
+  return {true, st.smoothedX, st.smoothedY, support};
+}
 
-    int j = i - 1;
+// =====================================================================
+// Hold position (no sensors see anything)
+// =====================================================================
 
-    while (j >= 0 && values[j] > value) {
+PlayerPosition holdPosition(PositionFilterState &st) {
+  if (st.hasPosition && millis() - st.lastFixMs <= POSITION_HOLD_MS)
+    return {true, st.smoothedX, st.smoothedY, 0};
+  st.hasPosition = false;
+  st.historyCount = st.historyIndex = 0;
+  return {false, -1.0f, -1.0f, 0};
+}
 
-      values[j + 1] = values[j];
+// =====================================================================
+// Beam sensitivity model
+// =====================================================================
+//
+// Gaussian roll-off: 1.0 on-axis, dropping to near-zero at the cutoff.
 
-      j--;
+float beamSensitivity(uint8_t offAxisDeg) {
+  if (offAxisDeg > BEAM_CUTOFF_DEG) return 0.0f;
+  float a = (float)offAxisDeg / BEAM_SIGMA_DEG;
+  return expf(-0.5f * a * a);
+}
+
+// Range uncertainty grows with distance.
+float rangeSigmaCm(float r) {
+  return RANGE_SIGMA_BASE_CM + RANGE_SIGMA_PER_CM * r;
+}
+
+// =====================================================================
+// Sensor log-likelihood for one cell
+// =====================================================================
+//
+// Given a sensor reading (or lack thereof), and the cell's expected
+// range and off-axis angle to this sensor, compute the log-likelihood
+// of seeing this reading if the player is at this cell.
+
+float sensorLogLikelihood(float reading, uint16_t cellR, uint8_t offDeg) {
+  float b = beamSensitivity(offDeg);
+
+  if (isValidDistance(reading)) {
+    // Sensor returned a valid reading.
+    if (b <= 0.0f) {
+      // Cell is outside this sensor's beam — the reading must be from
+      // something else (wall, reflection, etc.).
+      return logf(P_OUT_OF_BEAM);
     }
-
-    values[j + 1] = value;
+    // How well does the reading match the expected range?
+    float e = (reading - (float)cellR) / rangeSigmaCm(reading);
+    float rangeWeight = expf(-0.5f * e * e);
+    // Mixture: either the range matches, or it's a random mismatch.
+    float pIn = P_RANGE_MISMATCH + (1.0f - P_RANGE_MISMATCH) * rangeWeight;
+    return logf((1.0f - b) * P_OUT_OF_BEAM + b * pIn);
   }
 
-  if (count % 2 == 0) {
-
-    return (
-      values[count / 2 - 1] +
-      values[count / 2]
-    ) * 0.5f;
-  }
-
-  return values[count / 2];
+  // Sensor returned no reading (miss).
+  if (cellR < MIN_SENSOR_RANGE_CM) return 0.0f;  // too close to detect
+  if (b <= 0.0f) return 0.0f;                     // cell outside beam — miss is expected
+  // Cell is in beam but we got a miss — possible but less likely.
+  return logf((1.0f - b) + b * P_MISS_IN_BEAM);
 }
 
 // =====================================================================
-// Individual sensor filtering
+// Main position calculation — Bayesian grid scoring
 // =====================================================================
 
-float filterSensorDistance(
-  float distance,
-  size_t sensorIndex,
-  SensorDistanceFilterState &state
-) {
-
-  state.history[sensorIndex][
-    state.historyIndex[sensorIndex]
-  ] =
-    isValidDistance(distance)
-      ? distance
-      : -1.0f;
-
-  state.historyIndex[sensorIndex] =
-    (
-      state.historyIndex[sensorIndex] + 1
-    ) % SENSOR_HISTORY_SIZE;
-
-  if (
-    state.historyCount[sensorIndex]
-    < SENSOR_HISTORY_SIZE
-  ) {
-
-    state.historyCount[sensorIndex]++;
-  }
-
-  if (!isValidDistance(distance)) {
-    return -1.0f;
-  }
-
-  float samples[SENSOR_HISTORY_SIZE];
-
-  int sampleCount = 0;
-
-  for (
-    size_t i = 0;
-    i < state.historyCount[sensorIndex];
-    i++
-  ) {
-
-    float sample =
-      state.history[sensorIndex][i];
-
-    if (isValidDistance(sample)) {
-
-      samples[sampleCount++] = sample;
-    }
-  }
-
-  if (sampleCount < 3) {
-
-    return distance;
-  }
-
-  return medianOf(
-    samples,
-    sampleCount
-  );
-}
-
-// =====================================================================
-// Position history
-// =====================================================================
-
-PlayerPosition retainPosition(
-  const PositionFilterState &state
-) {
-
-  if (!state.hasPosition) {
-
-    return {
-      false,
-      -1.0f,
-      -1.0f
-    };
-  }
-
-  return {
-    true,
-    state.smoothedX,
-    state.smoothedY
-  };
-}
-
-// =====================================================================
-// Add position sample
-// =====================================================================
-
-PlayerPosition addPositionSample(
-  float x,
-  float y,
-  PositionFilterState &state
-) {
-
-  state.xHistory[state.historyIndex] = x;
-  state.yHistory[state.historyIndex] = y;
-
-  state.historyIndex =
-    (
-      state.historyIndex + 1
-    ) % POSITION_HISTORY_SIZE;
-
-  if (
-    state.historyCount
-    < POSITION_HISTORY_SIZE
-  ) {
-
-    state.historyCount++;
-  }
-
-  float xSamples[POSITION_HISTORY_SIZE];
-  float ySamples[POSITION_HISTORY_SIZE];
-
-  for (
-    size_t i = 0;
-    i < state.historyCount;
-    i++
-  ) {
-
-    xSamples[i] =
-      state.xHistory[i];
-
-    ySamples[i] =
-      state.yHistory[i];
-  }
-
-  float measuredX =
-    medianOf(
-      xSamples,
-      state.historyCount
-    );
-
-  float measuredY =
-    medianOf(
-      ySamples,
-      state.historyCount
-    );
-
-  if (!state.hasPosition) {
-
-    state.smoothedX = measuredX;
-    state.smoothedY = measuredY;
-
-    state.hasPosition = true;
-
-  } else {
-
-    state.smoothedX +=
-      POSITION_SMOOTHING_ALPHA *
-      (
-        measuredX -
-        state.smoothedX
-      );
-
-    state.smoothedY +=
-      POSITION_SMOOTHING_ALPHA *
-      (
-        measuredY -
-        state.smoothedY
-      );
-  }
-
-  return {
-    true,
-    state.smoothedX,
-    state.smoothedY
-  };
-}
-
-// =====================================================================
-// Get previous position in metres
-// =====================================================================
-
-void getPreviousPositionMeters(
-  const PositionFilterState &state,
-  float &xMeters,
-  float &depthMeters
-) {
-
-  if (!state.hasPosition) {
-
-    xMeters =
-      BOX_BASELINE_M * 0.5f;
-
-    depthMeters =
-      POSITION_MAP_DEPTH_M * 0.5f;
-
-    return;
-  }
-
-  xMeters =
-    state.smoothedX *
-    BOX_BASELINE_M;
-
-  depthMeters =
-    (
-      1.0f -
-      state.smoothedY
-    ) *
-    POSITION_MAP_DEPTH_M;
-}
-
-// =====================================================================
-// Calculate lateral signal from a sensor pair
-// =====================================================================
-//
-// Returns:
-//
-//   -1 = player appears toward sensor A
-//    0 = no meaningful lateral information
-//   +1 = player appears toward sensor B
-//
-// The signal is based only on the relative distance.
-//
-// This deliberately does NOT assume that the sensor mounting angle
-// creates an exact geometric ray.
-//
-// =====================================================================
-
-float calculatePairLateralSignal(
-  float sensorA,
-  float sensorB
-) {
-
-  bool validA =
-    isValidDistance(sensorA);
-
-  bool validB =
-    isValidDistance(sensorB);
-
-  if (!validA && !validB) {
-
-    return 0.0f;
-  }
-
-  if (validA && !validB) {
-
-    // Only A sees the player.
-    //
-    // Treat this as a moderate directional hint.
-    return -0.55f;
-  }
-
-  if (!validA && validB) {
-
-    // Only B sees the player.
-    return 0.55f;
-  }
-
-  float difference =
-    sensorB - sensorA;
-
-  float absoluteDifference =
-    fabsf(difference);
-
-  if (
-    absoluteDifference
-    < LATERAL_MIN_DIFFERENCE_CM
-  ) {
-
-    return 0.0f;
-  }
-
-  float strength =
-    (
-      absoluteDifference -
-      LATERAL_MIN_DIFFERENCE_CM
-    ) /
-    (
-      LATERAL_FULL_DIFFERENCE_CM -
-      LATERAL_MIN_DIFFERENCE_CM
-    );
-
-  strength =
-    fminf(
-      1.0f,
-      fmaxf(
-        0.0f,
-        strength
-      )
-    );
-
-  if (difference > 0.0f) {
-
-    return strength;
-
-  } else {
-
-    return -strength;
-  }
-}
-
-// =====================================================================
-// Convert pair lateral signal into X correction
-// =====================================================================
-
-float lateralSignalToCorrection(
-  float signal
-) {
-
-  return
-    signal *
-    LATERAL_CORRECTION_STRENGTH *
-    MAX_LATERAL_CORRECTION_M;
-}
-
-// =====================================================================
-// Combine lateral information from master and slave
-// =====================================================================
-
-float calculateCombinedLateralSignal(
-  float sensor1,
-  float sensor2,
-  float sensor3,
-  float sensor4
-) {
-
-  float masterSignal =
-    calculatePairLateralSignal(
-      sensor1,
-      sensor2
-    );
-
-  float slaveSignal =
-    calculatePairLateralSignal(
-      sensor3,
-      sensor4
-    );
-
-  bool masterUseful =
-    fabsf(masterSignal) > 0.01f;
-
-  bool slaveUseful =
-    fabsf(slaveSignal) > 0.01f;
-
-  if (!masterUseful && !slaveUseful) {
-
-    return 0.0f;
-  }
-
-  if (masterUseful && !slaveUseful) {
-
-    return masterSignal;
-  }
-
-  if (!masterUseful && slaveUseful) {
-
-    return slaveSignal;
-  }
-
-  // If both boxes agree on direction,
-  // strongly trust the result.
-
-  if (
-    (masterSignal > 0.0f &&
-     slaveSignal > 0.0f) ||
-
-    (masterSignal < 0.0f &&
-     slaveSignal < 0.0f)
-  ) {
-
-    return (
-      masterSignal +
-      slaveSignal
-    ) * 0.5f;
-  }
-
-  // The boxes disagree.
-  //
-  // Don't let them fight the position.
-  //
-  // The stronger signal gets a reduced influence.
-
-  float masterStrength =
-    fabsf(masterSignal);
-
-  float slaveStrength =
-    fabsf(slaveSignal);
-
-  if (
-    masterStrength >
-    slaveStrength
-  ) {
-
-    return masterSignal * 0.35f;
-
-  } else {
-
-    return slaveSignal * 0.35f;
-  }
-}
-
-// =====================================================================
-// Choose a usable range from one box
-// =====================================================================
-//
-// Used by both normal two-box positioning and one-box recovery.
-//
-// With the 45/70 layout the two sensors in a box cover different sectors,
-// so usually only one of them has the player in its beam:
-//
-//   - only one valid          -> use it
-//   - both valid and close    -> average them (same target, two views)
-//   - both valid, disagree    -> use the nearer one. The player is
-//     normally the nearest object, and the farther echo is more likely
-//     a wall or another object than the player.
-//
-
-float chooseBoxRange(
-  float sensorA,
-  float sensorB
-) {
-
-  bool validA =
-    isValidDistance(sensorA);
-
-  bool validB =
-    isValidDistance(sensorB);
-
-  if (!validA && !validB) {
-
-    return -1.0f;
-  }
-
-  if (validA && !validB) {
-
-    return sensorA;
-  }
-
-  if (!validA && validB) {
-
-    return sensorB;
-  }
-
-  if (
-    fabsf(sensorA - sensorB) >
-    BOX_PAIR_MAX_DISAGREEMENT_CM
-  ) {
-
-    return fminf(
-      sensorA,
-      sensorB
-    );
-  }
-
-  // Close agreement: average for depth/recovery.
-  return (
-    sensorA +
-    sensorB
-  ) * 0.5f;
-}
-
-// =====================================================================
-// One-box recovery
-// =====================================================================
-//
-// Used when only one physical box can see the player.
-//
-// This retains the previous X and estimates depth from the available
-// range. The pair's lateral difference is used as a small directional
-// correction.
-//
-// =====================================================================
-
-PlayerPosition calculateOneBoxRecovery(
-  float sensor1,
-  float sensor2,
-  bool isMasterBox,
-  PositionFilterState &state
-) {
-
-  if (!state.hasPosition) {
-
-    return {
-      false,
-      -1.0f,
-      -1.0f
-    };
-  }
-
-  float previousX;
-  float previousDepth;
-
-  getPreviousPositionMeters(
-    state,
-    previousX,
-    previousDepth
-  );
-
-  float boxX =
-    isMasterBox
-      ? 0.0f
-      : BOX_BASELINE_M;
-
-  float rangeCm =
-    chooseBoxRange(
-      sensor1,
-      sensor2
-    );
-
-  if (!isValidDistance(rangeCm)) {
-
-    return retainPosition(state);
-  }
-
-  float rangeM =
-    rangeCm / 100.0f;
-
-  // ---------------------------------------------------------------
-  // Estimate depth from previous X.
-  // ---------------------------------------------------------------
-
-  float dx =
-    previousX -
-    boxX;
-
-  float depthSquared =
-    rangeM * rangeM -
-    dx * dx;
-
-  float recoveredDepth;
-
-  if (depthSquared >= 0.0f) {
-
-    recoveredDepth =
-      sqrtf(depthSquared);
-
-  } else {
-
-    recoveredDepth =
-      previousDepth;
-  }
-
-  // ---------------------------------------------------------------
-  // Use sensor-pair difference as a weak X correction.
-  // ---------------------------------------------------------------
-
-  float lateralSignal =
-    calculatePairLateralSignal(
-      sensor1,
-      sensor2
-    );
-
-  float correction =
-    lateralSignalToCorrection(
-      lateralSignal
-    );
-
-  // Sensor pair orientation:
-  //
-  // Master:
-  //   negative = toward sensor 1 side
-  //   positive = toward sensor 2 side
-  //
-  // Slave is physically mirrored across the play area, so reverse it.
-
-  if (!isMasterBox) {
-
-    correction *= -1.0f;
-  }
-
-  float recoveredX =
-    previousX +
-    correction;
-
-  recoveredX =
-    fminf(
-      BOX_BASELINE_M,
-      fmaxf(
-        0.0f,
-        recoveredX
-      )
-    );
-
-  recoveredDepth =
-    fminf(
-      POSITION_MAP_DEPTH_M,
-      fmaxf(
-        0.0f,
-        recoveredDepth
-      )
-    );
-
-  // ---------------------------------------------------------------
-  // Dead zone
-  // ---------------------------------------------------------------
-
-  static bool deadZoneLatchedRecovery = false;
-
-  if (deadZoneLatchedRecovery) {
-
-    deadZoneLatchedRecovery =
-      recoveredDepth <=
-      DEAD_ZONE_RELEASE_DEPTH_M;
-
-  } else {
-
-    deadZoneLatchedRecovery =
-      recoveredDepth <=
-      DEAD_ZONE_DEPTH_M;
-  }
-
-  playerInDeadZone =
-    deadZoneLatchedRecovery;
-
-  // ---------------------------------------------------------------
-  // Convert to graph coordinates.
-  // ---------------------------------------------------------------
-
-  float x =
-    fminf(
-      1.0f,
-      fmaxf(
-        0.0f,
-        recoveredX /
-        BOX_BASELINE_M
-      )
-    );
-
-  float y =
-    1.0f -
-    recoveredDepth /
-    POSITION_MAP_DEPTH_M;
-
-  state.lastRecoveryMs =
-    millis();
-
-  return addPositionSample(
-    x,
-    y,
-    state
-  );
-}
-
-// =====================================================================
-// Normal two-box positioning
-// =====================================================================
-//
-// The important change:
-//
-// We calculate the normal trilateration position from the individual
-// sensor groups, but then ALSO inspect the individual sensor differences
-// for lateral information.
-//
-// The lateral information is used to correct X.
-//
-// =====================================================================
-
-PlayerPosition calculatePlayerPosition(
-  float sensor1,
-  float sensor2,
-  float sensor3,
-  float sensor4
-) {
-
+PlayerPosition calculatePlayerPosition(const float rawCm[NUM_SENSORS]) {
   static PositionFilterState filterState = {};
-
-  static SensorDistanceFilterState
-    distanceFilterState = {};
-
+  static SensorDistanceFilterState distState = {};
   static bool deadZoneLatched = false;
 
+  unsigned long startUs = micros();
   playerInDeadZone = false;
+  lastSupportMask = 0;
 
-  // -------------------------------------------------------------------
-  // 1. Filter each individual ultrasonic sensor.
-  // -------------------------------------------------------------------
+  // -----------------------------------------------------------------
+  // 1. Gate and filter each sensor.
+  // -----------------------------------------------------------------
 
-  float f1 =
-    filterSensorDistance(
-      sensor1,
-      0,
-      distanceFilterState
-    );
+  float f[NUM_SENSORS];
+  int validCount = 0;
+  for (int s = 0; s < NUM_SENSORS; s++) {
+    float gated = gateReading(s, rawCm[s]);
+    f[s] = filterSensorDistance(gated, s, distState);
+    lastFilteredCm[s] = f[s];
+    if (isValidDistance(f[s])) validCount++;
+  }
 
-  float f2 =
-    filterSensorDistance(
-      sensor2,
-      1,
-      distanceFilterState
-    );
+  // No sensors see anything — hold the last position for a while.
+  if (validCount == 0) return holdPosition(filterState);
 
-  float f3 =
-    filterSensorDistance(
-      sensor3,
-      2,
-      distanceFilterState
-    );
+  // -----------------------------------------------------------------
+  // 2. Optional prior: pull toward the previous position.
+  // -----------------------------------------------------------------
 
-  float f4 =
-    filterSensorDistance(
-      sensor4,
-      3,
-      distanceFilterState
-    );
+  unsigned long now = millis();
+  bool usePrior = filterState.hasPosition &&
+                  (now - filterState.lastFixMs <= PRIOR_MAX_AGE_MS);
+  float priorX     = filterState.smoothedX * BOX_BASELINE_M;
+  float priorDepth = (1.0f - filterState.smoothedY) * POSITION_MAP_DEPTH_M;
+  float invTwoSigmaSq = 1.0f / (2.0f * PRIOR_SIGMA_M * PRIOR_SIGMA_M);
 
-  // -------------------------------------------------------------------
-  // 2. Determine whether each box has information.
-  // -------------------------------------------------------------------
+  // -----------------------------------------------------------------
+  // 3. Score every grid cell.
+  // -----------------------------------------------------------------
 
-  bool masterHasReading =
-    isValidDistance(f1) ||
-    isValidDistance(f2);
-
-  bool slaveHasReading =
-    isValidDistance(f3) ||
-    isValidDistance(f4);
-
-  // -------------------------------------------------------------------
-  // 3. Normal two-box positioning.
-  // -------------------------------------------------------------------
-
-  if (
-    masterHasReading &&
-    slaveHasReading
-  ) {
-
-    // ---------------------------------------------------------------
-    // Pick one range per box (see chooseBoxRange for the rules).
-    //
-    // The lateral difference remains available separately.
-    // ---------------------------------------------------------------
-
-    float masterRangeCm =
-      chooseBoxRange(
-        f1,
-        f2
-      );
-
-    float slaveRangeCm =
-      chooseBoxRange(
-        f3,
-        f4
-      );
-
-    if (
-      isValidDistance(masterRangeCm) &&
-      isValidDistance(slaveRangeCm)
-    ) {
-
-      float rm =
-        masterRangeCm /
-        100.0f;
-
-      float rs =
-        slaveRangeCm /
-        100.0f;
-
-      float D =
-        BOX_BASELINE_M;
-
-      // -------------------------------------------------------------
-      // Normal two-circle trilateration.
-      // -------------------------------------------------------------
-
-      float xMeters =
-        (
-          rm * rm -
-          rs * rs +
-          D * D
-        ) /
-        (
-          2.0f * D
+  float best = -1e30f;
+  int bestIdx = -1;
+  for (int row = 0; row < GRID_ROWS; row++) {
+    for (int col = 0; col < GRID_COLS; col++) {
+      int idx = row * GRID_COLS + col;
+      float score = 0.0f;
+      for (int s = 0; s < NUM_SENSORS; s++) {
+        score += sensorLogLikelihood(
+          f[s], cellRangeCm[idx][s], cellOffAxisDeg[idx][s]
         );
-
-      float depthSquared =
-        rm * rm -
-        xMeters * xMeters;
-
-      if (
-        depthSquared >=
-        -0.0025f
-      ) {
-
-        if (
-          depthSquared < 0.0f
-        ) {
-
-          depthSquared = 0.0f;
-        }
-
-        float depthMeters =
-          sqrtf(
-            depthSquared
-          );
-
-        // -----------------------------------------------------------
-        // Geometric bounds.
-        // -----------------------------------------------------------
-
-        if (
-          xMeters >=
-          -POSITION_X_MARGIN_M &&
-
-          xMeters <=
-          D + POSITION_X_MARGIN_M &&
-
-          depthMeters >= 0.0f &&
-
-          depthMeters <=
-          POSITION_MAP_DEPTH_M
-        ) {
-
-          // ---------------------------------------------------------
-          // NEW:
-          //
-          // Calculate lateral signal from all four sensors.
-          // ---------------------------------------------------------
-
-          float lateralSignal =
-            calculateCombinedLateralSignal(
-              f1,
-              f2,
-              f3,
-              f4
-            );
-
-          float lateralCorrection =
-            lateralSignalToCorrection(
-              lateralSignal
-            );
-
-          // ---------------------------------------------------------
-          // Apply correction.
-          //
-          // This is deliberately limited.
-          // ---------------------------------------------------------
-
-          xMeters =
-  D * 0.5f +
-  X_GAIN * (xMeters - D * 0.5f);
-
-          // ---------------------------------------------------------
-          // Keep X inside physical area.
-          // ---------------------------------------------------------
-
-          xMeters =
-            fminf(
-              D,
-              fmaxf(
-                0.0f,
-                xMeters
-              )
-            );
-
-          // ---------------------------------------------------------
-          // Dead zone.
-          // ---------------------------------------------------------
-
-          if (deadZoneLatched) {
-
-            deadZoneLatched =
-              depthMeters <=
-              DEAD_ZONE_RELEASE_DEPTH_M;
-
-          } else {
-
-            deadZoneLatched =
-              depthMeters <=
-              DEAD_ZONE_DEPTH_M;
-          }
-
-          playerInDeadZone =
-            deadZoneLatched;
-
-          // ---------------------------------------------------------
-          // Normalise X and Y.
-          // ---------------------------------------------------------
-
-          float x =
-            fminf(
-              1.0f,
-              fmaxf(
-                0.0f,
-                xMeters / D
-              )
-            );
-
-          float y =
-            1.0f -
-            depthMeters /
-            POSITION_MAP_DEPTH_M;
-
-          filterState.lastFullPositionMs =
-            millis();
-
-          // ---------------------------------------------------------
-          // Diagnostics.
-          // ---------------------------------------------------------
-
-          Serial.println();
-
-          Serial.println(
-            "========== POSITION DEBUG =========="
-          );
-
-          Serial.print(
-            "Filtered S1: "
-          );
-          printDistanceValue(f1);
-
-          Serial.print(
-            " | S2: "
-          );
-          printDistanceValue(f2);
-
-          Serial.print(
-            " | S3: "
-          );
-          printDistanceValue(f3);
-
-          Serial.print(
-            " | S4: "
-          );
-          printDistanceValue(f4);
-
-          Serial.println();
-
-          Serial.print(
-            "Master difference: "
-          );
-          Serial.print(
-            f2 - f1,
-            2
-          );
-          Serial.println(
-            " cm"
-          );
-
-          Serial.print(
-            "Slave difference: "
-          );
-          Serial.print(
-            f4 - f3,
-            2
-          );
-          Serial.println(
-            " cm"
-          );
-
-          Serial.print(
-            "Lateral signal: "
-          );
-          Serial.println(
-            lateralSignal,
-            3
-          );
-
-          Serial.print(
-            "Lateral correction: "
-          );
-          Serial.print(
-            lateralCorrection,
-            3
-          );
-          Serial.println(
-            " m"
-          );
-
-          Serial.print(
-            "Trilateration X before correction: "
-          );
-
-          float rawX =
-            (
-              rm * rm -
-              rs * rs +
-              D * D
-            ) /
-            (
-              2.0f * D
-            );
-
-          Serial.println(
-            rawX / D,
-            3
-          );
-
-          Serial.print(
-            "Final X: "
-          );
-          Serial.println(
-            x,
-            3
-          );
-
-          Serial.print(
-            "Y: "
-          );
-          Serial.println(
-            y,
-            3
-          );
-
-          Serial.println(
-            "===================================="
-          );
-
-          return addPositionSample(
-            x,
-            y,
-            filterState
-          );
-        }
       }
+      if (usePrior) {
+        float dx = col * GRID_STEP_M - priorX;
+        float dy = row * GRID_STEP_M - priorDepth;
+        score -= (dx * dx + dy * dy) * invTwoSigmaSq;
+      }
+      cellScore[idx] = score;
+      if (score > best) { best = score; bestIdx = idx; }
     }
   }
 
-  // -------------------------------------------------------------------
-  // 4. One-box recovery.
-  // -------------------------------------------------------------------
+  // -----------------------------------------------------------------
+  // 4. Count supporting sensors for the peak cell.
+  // -----------------------------------------------------------------
+  //
+  // A sensor "supports" the peak if:
+  //   - it has a valid reading
+  //   - the peak cell is within its beam (sensitivity >= threshold)
+  //   - the reading matches the cell's expected range within 3σ
 
-  if (
-    masterHasReading &&
-    !slaveHasReading
-  ) {
-
-    if (filterState.hasPosition) {
-
-      unsigned long now =
-        millis();
-
-      if (
-        now -
-        filterState.lastFullPositionMs
-        <=
-        ONE_BOX_RECOVERY_TIMEOUT_MS
-      ) {
-
-        return calculateOneBoxRecovery(
-          f1,
-          f2,
-          true,
-          filterState
-        );
-      }
+  int support = 0;
+  for (int s = 0; s < NUM_SENSORS; s++) {
+    if (!isValidDistance(f[s])) continue;
+    float b   = beamSensitivity(cellOffAxisDeg[bestIdx][s]);
+    float err = fabsf(f[s] - (float)cellRangeCm[bestIdx][s]);
+    if (b >= SUPPORT_MIN_BEAM && err <= 3.0f * rangeSigmaCm(f[s])) {
+      support++;
+      lastSupportMask |= (1 << s);
     }
   }
 
-  if (
-    slaveHasReading &&
-    !masterHasReading
-  ) {
+  // No sensor supports the peak — the readings are probably noise.
+  if (support == 0) {
+    lastFitMicros = micros() - startUs;
+    return holdPosition(filterState);
+  }
 
-    if (filterState.hasPosition) {
+  // -----------------------------------------------------------------
+  // 5. Weighted centroid around the peak for sub-grid resolution.
+  // -----------------------------------------------------------------
 
-      unsigned long now =
-        millis();
+  float bestX = (bestIdx % GRID_COLS) * GRID_STEP_M;
+  float bestY = (bestIdx / GRID_COLS) * GRID_STEP_M;
+  float sumW = 0.0f, sumX = 0.0f, sumY = 0.0f;
+  float radiusSq = PEAK_RADIUS_M * PEAK_RADIUS_M;
 
-      if (
-        now -
-        filterState.lastFullPositionMs
-        <=
-        ONE_BOX_RECOVERY_TIMEOUT_MS
-      ) {
-
-        return calculateOneBoxRecovery(
-          f3,
-          f4,
-          false,
-          filterState
-        );
-      }
+  for (int row = 0; row < GRID_ROWS; row++) {
+    for (int col = 0; col < GRID_COLS; col++) {
+      float cx = col * GRID_STEP_M;
+      float cy = row * GRID_STEP_M;
+      float dx = cx - bestX;
+      float dy = cy - bestY;
+      if (dx * dx + dy * dy > radiusSq) continue;
+      float w = expf(cellScore[row * GRID_COLS + col] - best);
+      sumW += w;
+      sumX += w * cx;
+      sumY += w * cy;
     }
   }
 
-  // -------------------------------------------------------------------
-  // 5. No usable information.
-  // -------------------------------------------------------------------
+  float xMeters     = sumW > 0.0f ? sumX / sumW : bestX;
+  float depthMeters = sumW > 0.0f ? sumY / sumW : bestY;
 
-  playerInDeadZone = false;
+  // -----------------------------------------------------------------
+  // 6. Dead zone with hysteresis.
+  // -----------------------------------------------------------------
 
-  return retainPosition(
-    filterState
-  );
+  if (deadZoneLatched) {
+    deadZoneLatched = depthMeters <= DEAD_ZONE_RELEASE_M;
+  } else {
+    deadZoneLatched = depthMeters <= DEAD_ZONE_DEPTH_M;
+  }
+  playerInDeadZone = deadZoneLatched;
+
+  // -----------------------------------------------------------------
+  // 7. Normalise to 0..1 and smooth.
+  // -----------------------------------------------------------------
+
+  float x = fminf(1.0f, fmaxf(0.0f, xMeters / BOX_BASELINE_M));
+  float y = fminf(1.0f, fmaxf(0.0f, 1.0f - depthMeters / POSITION_MAP_DEPTH_M));
+
+  lastFitMicros = micros() - startUs;
+  return addPositionSample(x, y, support, filterState);
 }
 
 // =====================================================================
 // Buzzer
 // =====================================================================
 
-void setBuzzerOutput(
-  bool enabled
-) {
-
-  static bool outputEnabled = false;
-
-  if (
-    enabled ==
-    outputEnabled
-  ) {
-
-    return;
-  }
-
-  if (enabled) {
-
-    tone(
-      BUZZER_PIN,
-      BUZZER_FREQUENCY_HZ
-    );
-
-  } else {
-
-    noTone(
-      BUZZER_PIN
-    );
-  }
-
-  outputEnabled =
-    enabled;
+void setBuzzerOutput(bool on) {
+  static bool enabled = false;
+  if (on == enabled) return;
+  if (on) tone(BUZZER_PIN, BUZZER_FREQUENCY_HZ);
+  else noTone(BUZZER_PIN);
+  enabled = on;
 }
 
 // =====================================================================
 // ESP-NOW receive callback
 // =====================================================================
 
-void handleSlavePacket(
-  const uint8_t *incomingData,
-  int length
-) {
-
-  if (
-    length !=
-    sizeof(SensorPacket)
-  ) {
-
-    Serial.print(
-      "Got ESP-NOW packet with wrong size: "
-    );
-
-    Serial.println(
-      length
-    );
-
+void handleSlavePacket(const uint8_t *data, int len) {
+  if (len != (int)sizeof(SensorPacket)) {
+    Serial.printf("ESP-NOW wrong size %d (expect %d)\n", len, sizeof(SensorPacket));
     return;
   }
-
-  SensorPacket packet;
-
-  memcpy(
-    &packet,
-    incomingData,
-    sizeof(packet)
-  );
-
-  slaveSensor1Cm =
-    packet.sensor1Cm;
-
-  slaveSensor2Cm =
-    packet.sensor2Cm;
-
-  lastSlavePacketMs =
-    millis();
-
-  slaveReplyReady =
-    true;
-
-  Serial.println(
-    "Slave reply received by master"
-  );
+  SensorPacket pkt;
+  memcpy(&pkt, data, sizeof(pkt));
+  slaveSensorCm[0] = pkt.sensor1Cm;
+  slaveSensorCm[1] = pkt.sensor2Cm;
+  slaveSensorCm[2] = pkt.sensor3Cm;
+  lastSlavePacketMs = millis();
+  slaveReplyReady = true;
 }
 
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
-
-void onDataReceived(
-  const esp_now_recv_info_t *,
-  const uint8_t *incomingData,
-  int length
-) {
-
+void onDataReceived(const esp_now_recv_info_t *, const uint8_t *data, int len) {
 #else
-
-void onDataReceived(
-  const uint8_t *,
-  const uint8_t *incomingData,
-  int length
-) {
-
+void onDataReceived(const uint8_t *, const uint8_t *data, int len) {
 #endif
-
-  handleSlavePacket(
-    incomingData,
-    length
-  );
+  handleSlavePacket(data, len);
 }
 
 // =====================================================================
-// Request a sample from slave
+// Non-blocking wait (services web server while waiting)
+// =====================================================================
+
+void waitMs(unsigned long ms) {
+  unsigned long start = millis();
+  do {
+    webServer.handleClient();
+    delay(1);
+  } while (millis() - start < ms);
+}
+
+// =====================================================================
+// Request a sample from the slave
 // =====================================================================
 
 bool requestSlaveSample() {
+  slaveReplyReady = false;
+  uint8_t req = SLAVE_SAMPLE_REQUEST;
+  waitMs(SENSOR_SETTLE_DELAY_MS);
 
-  slaveReplyReady =
-    false;
-
-  uint8_t request =
-    SLAVE_SAMPLE_REQUEST;
-
-  delay(
-    SENSOR_SETTLE_DELAY_MS
-  );
-
-  if (
-    esp_now_send(
-      ESPNOW_BROADCAST_MAC,
-      &request,
-      sizeof(request)
-    ) != ESP_OK
-  ) {
-
+  if (esp_now_send(ESPNOW_BROADCAST_MAC, &req, 1) != ESP_OK) {
+    Serial.println("ESP-NOW send request FAILED");
     return false;
   }
 
-  unsigned long requestStartedMs =
-    millis();
-
-  while (
-    !slaveReplyReady &&
-    millis() -
-    requestStartedMs < 250
-  ) {
-
+  unsigned long t0 = millis();
+  while (!slaveReplyReady && millis() - t0 < SLAVE_REPLY_TIMEOUT_MS) {
+    webServer.handleClient();
     delay(1);
   }
-
   return slaveReplyReady;
 }
 
 // =====================================================================
-// JSON builder
+// Sample cycle: read all 6 sensors, compute position, build JSON
 // =====================================================================
 
-void buildSensorJson(
-  char *buffer,
-  size_t bufferSize
-) {
+void buildSensorJson(char *buf, size_t bufSize) {
+  float s[NUM_SENSORS];
 
-  // ---------------------------------------------------------------
-  // Master sensor 1
-  // ---------------------------------------------------------------
-
-  float sensor1 =
-    readSensorDistance(
-      SENSOR_1_TRIG_PIN,
-      SENSOR_1_ECHO_PIN
-    );
-
-  delay(
-    SENSOR_SETTLE_DELAY_MS
-  );
-
-  // ---------------------------------------------------------------
-  // Master sensor 2
-  // ---------------------------------------------------------------
-
-  float sensor2 =
-    readSensorDistance(
-      SENSOR_2_TRIG_PIN,
-      SENSOR_2_ECHO_PIN
-    );
-
-  delay(
-    SENSOR_SETTLE_DELAY_MS
-  );
-
-  // ---------------------------------------------------------------
-  // Ask slave to fire its sensors.
-  // ---------------------------------------------------------------
-
-  bool slaveSampleReceived =
-    requestSlaveSample();
-
-  float remote1 =
-    slaveSampleReceived
-      ? slaveSensor1Cm
-      : -1.0f;
-
-  float remote2 =
-    slaveSampleReceived
-      ? slaveSensor2Cm
-      : -1.0f;
-
-  // ---------------------------------------------------------------
-  // Closest raw distance for dashboard.
-  // ---------------------------------------------------------------
-
-  float closest =
-    -1.0f;
-
-  if (
-    isValidDistance(sensor1)
-  ) {
-
-    closest =
-      sensor1;
+  // --- Master sensors (S1, S2, S3) ---
+  for (int i = 0; i < SENSORS_PER_BOX; i++) {
+    s[i] = readSensorDistance(SENSOR_TRIG_PINS[i], SENSOR_ECHO_PINS[i]);
+    waitMs(SENSOR_SETTLE_DELAY_MS);
   }
 
-  if (
-    isValidDistance(sensor2)
-  ) {
+  // --- Slave sensors (S4, S5, S6) ---
+  bool slaveOk = requestSlaveSample();
+  for (int i = 0; i < SENSORS_PER_BOX; i++) {
+    s[SENSORS_PER_BOX + i] = slaveOk ? slaveSensorCm[i] : -1.0f;
+  }
+  if (!slaveOk) Serial.println("!! No reply from slave");
 
-    if (
-      !isValidDistance(closest) ||
-      sensor2 < closest
-    ) {
-
-      closest =
-        sensor2;
-    }
+  // --- Closest raw distance (for dashboard) ---
+  float closest = -1.0f;
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    if (isValidDistance(s[i]) && (!isValidDistance(closest) || s[i] < closest))
+      closest = s[i];
   }
 
-  if (
-    isValidDistance(remote1)
-  ) {
+  // --- Calculate position ---
+  PlayerPosition pos = calculatePlayerPosition(s);
 
-    if (
-      !isValidDistance(closest) ||
-      remote1 < closest
-    ) {
+  // --- Buzzer (local + remote) ---
+  setBuzzerOutput(playerInDeadZone);
+  uint8_t buzzCmd = playerInDeadZone ? 1 : 0;
+  esp_now_send(ESPNOW_BROADCAST_MAC, &buzzCmd, 1);
 
-      closest =
-        remote1;
-    }
-  }
-
-  if (
-    isValidDistance(remote2)
-  ) {
-
-    if (
-      !isValidDistance(closest) ||
-      remote2 < closest
-    ) {
-
-      closest =
-        remote2;
-    }
-  }
-
-  // ---------------------------------------------------------------
-  // Calculate position.
-  // ---------------------------------------------------------------
-
-  PlayerPosition position =
-    calculatePlayerPosition(
-      sensor1,
-      sensor2,
-      remote1,
-      remote2
-    );
-
-  // ---------------------------------------------------------------
-  // Buzzer.
-  // ---------------------------------------------------------------
-
-  setBuzzerOutput(
-    playerInDeadZone
-  );
-
-  uint8_t buzzerCommand =
-    playerInDeadZone
-      ? 1
-      : 0;
-
-  esp_now_send(
-    ESPNOW_BROADCAST_MAC,
-    &buzzerCommand,
-    sizeof(buzzerCommand)
-  );
-
-  // ---------------------------------------------------------------
-  // JSON.
-  // ---------------------------------------------------------------
-
-  snprintf(
-    buffer,
-    bufferSize,
-
+  // --- Build JSON ---
+  snprintf(buf, bufSize,
     "{\"mac\":\"%s\","
-    "\"sensor1\":%.2f,"
-    "\"sensor2\":%.2f,"
-    "\"sensor3\":%.2f,"
-    "\"sensor4\":%.2f,"
-    "\"closest\":%.2f,"
-    "\"x\":%.3f,"
-    "\"y\":%.3f}",
-
+    "\"sensor1\":%.2f,\"sensor2\":%.2f,\"sensor3\":%.2f,"
+    "\"sensor4\":%.2f,\"sensor5\":%.2f,\"sensor6\":%.2f,"
+    "\"closest\":%.2f,\"x\":%.3f,\"y\":%.3f,\"support\":%d,"
+    "\"deadZone\":%s}",
     WiFi.macAddress().c_str(),
-
-    sensor1,
-    sensor2,
-    remote1,
-    remote2,
-
+    s[0], s[1], s[2], s[3], s[4], s[5],
     closest,
+    pos.valid ? pos.x : -1.0f,
+    pos.valid ? pos.y : -1.0f,
+    pos.valid ? pos.support : 0,
+    playerInDeadZone ? "true" : "false");
 
-    position.valid
-      ? position.x
-      : -1.0f,
-
-    position.valid
-      ? position.y
-      : -1.0f
-  );
-
-  // ---------------------------------------------------------------
-  // General serial diagnostics.
-  // ---------------------------------------------------------------
-
+  // --- Serial summary ---
   Serial.println();
-
-  Serial.println(
-    "---------------- POSITION ----------------"
-  );
-
-  Serial.print(
-    "Sensor 1: "
-  );
-
-  printDistanceValue(
-    sensor1
-  );
-
-  Serial.print(
-    " | Sensor 2: "
-  );
-
-  printDistanceValue(
-    sensor2
-  );
-
-  Serial.print(
-    " | Sensor 3: "
-  );
-
-  printDistanceValue(
-    remote1
-  );
-
-  Serial.print(
-    " | Sensor 4: "
-  );
-
-  printDistanceValue(
-    remote2
-  );
-
-  Serial.print(
-    " | closest: "
-  );
-
-  printDistanceValue(
-    closest
-  );
-
-  Serial.print(
-    " | x: "
-  );
-
-  if (position.valid) {
-
-    Serial.print(
-      position.x,
-      3
-    );
-
-  } else {
-
-    Serial.print(
-      "NaN"
-    );
+  Serial.println("---------------- POSITION ----------------");
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    Serial.printf("S%d%s=", i + 1, (lastSupportMask & (1 << i)) ? "*" : "");
+    printDistanceValue(s[i]);
+    Serial.print(i == 2 ? "\n" : "  ");
   }
-
-  Serial.print(
-    " | y: "
-  );
-
-  if (position.valid) {
-
-    Serial.print(
-      position.y,
-      3
-    );
-
-  } else {
-
-    Serial.print(
-      "NaN"
-    );
-  }
-
-  Serial.print(
-    " | dead zone: "
-  );
-
-  Serial.println(
-    playerInDeadZone
-      ? "YES"
-      : "no"
-  );
+  Serial.printf("x: %s | y: %s | support: %d/6 | dead: %s | fit: %lu us\n",
+    pos.valid ? String(pos.x, 3).c_str() : "NaN",
+    pos.valid ? String(pos.y, 3).c_str() : "NaN",
+    pos.valid ? pos.support : 0,
+    playerInDeadZone ? "YES" : "no",
+    lastFitMicros);
 }
 
 // =====================================================================
@@ -1885,526 +798,206 @@ void buildSensorJson(
 
 const char DASHBOARD_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html>
-
 <html>
-
 <head>
-
 <meta charset="UTF-8">
-
-<meta
-  name="viewport"
-  content="width=device-width, initial-scale=1"
->
-
-<title>Sensor Dashboard</title>
-
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Whack-a-Mole — 6-Sensor Dashboard</title>
 <style>
-
-body {
-
-  font-family:
-    Consolas,
-    "Courier New",
-    monospace;
-
-  background: #111;
-
-  color: #eee;
-
-  margin: 0;
-
-  padding: 24px;
-}
-
-h1 {
-
-  font-size: 18px;
-
-  margin: 0 0 16px 0;
-}
-
-.grid {
-
-  display: grid;
-
-  grid-template-columns:
-    repeat(3, 1fr);
-
-  gap: 14px;
-
-  max-width: 620px;
-}
-
-.box {
-
-  background: #1a1a1a;
-
-  border: 1px solid #333;
-
-  border-radius: 10px;
-
-  padding: 18px;
-
-  text-align: center;
-}
-
-.box-label {
-
-  font-size: 13px;
-
-  color: #888;
-
-  text-transform: uppercase;
-
-  letter-spacing: 0.05em;
-
-  margin-bottom: 8px;
-}
-
-.box-value {
-
-  font-size: 30px;
-
-  font-weight: bold;
-}
-
-.status {
-
-  margin-top: 16px;
-
-  color: #888;
-
-  font-size: 12px;
-}
-
-.position-map {
-
-  margin-top: 18px;
-
-  width: min(100%, 620px);
-
-  background: #1a1a1a;
-
-  border: 1px solid #333;
-
-  border-radius: 10px;
-
-  padding: 12px;
-}
-
-canvas {
-
-  display: block;
-
-  width: 100%;
-
-  height: auto;
-
-  background: #101820;
-}
-
+*{box-sizing:border-box}
+body{font-family:Consolas,"Courier New",monospace;background:#111;color:#eee;margin:0;padding:24px}
+h1{font-size:18px;margin:0 0 16px}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;max-width:660px}
+.box{background:#1a1a1a;border:1px solid #333;border-radius:10px;padding:14px;text-align:center}
+.box-label{font-size:12px;color:#888;text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px}
+.box-value{font-size:26px;font-weight:bold}
+.box.master .box-label{color:#4aa3ff}
+.box.slave .box-label{color:#5ed39a}
+.box.dead-active{border-color:#ff4444;box-shadow:0 0 8px #ff4444aa}
+.status{margin-top:16px;color:#888;font-size:12px}
+.position-map{margin-top:18px;width:min(100%,660px);background:#1a1a1a;border:1px solid #333;border-radius:10px;padding:12px;box-sizing:border-box}
+canvas{display:block;width:100%;height:auto;background:#101820}
+.legend{margin-top:10px;font-size:11px;color:#888}
+.legend span{display:inline-block;width:12px;height:12px;border-radius:3px;vertical-align:middle;margin-right:4px}
 </style>
-
 </head>
-
 <body>
-
-<h1>ESP32 Sensor Dashboard</h1>
-
+<h1>🕹️ Whack-a-Mole — 6-Sensor Dashboard</h1>
 <div class="grid">
-
-  <div class="box">
-
-    <div class="box-label">
-      Sensor 1
-    </div>
-
-    <div
-      class="box-value"
-      id="s1"
-    >
-      --
-    </div>
-
-  </div>
-
-  <div class="box">
-
-    <div class="box-label">
-      Sensor 2
-    </div>
-
-    <div
-      class="box-value"
-      id="s2"
-    >
-      --
-    </div>
-
-  </div>
-
-  <div class="box">
-
-    <div class="box-label">
-      Sensor 3
-    </div>
-
-    <div
-      class="box-value"
-      id="s3"
-    >
-      --
-    </div>
-
-  </div>
-
-  <div class="box">
-
-    <div class="box-label">
-      Sensor 4
-    </div>
-
-    <div
-      class="box-value"
-      id="s4"
-    >
-      --
-    </div>
-
-  </div>
-
-  <div class="box">
-
-    <div class="box-label">
-      X coordinate
-    </div>
-
-    <div
-      class="box-value"
-      id="x"
-    >
-      --
-    </div>
-
-  </div>
-
-  <div class="box">
-
-    <div class="box-label">
-      Y coordinate
-    </div>
-
-    <div
-      class="box-value"
-      id="y"
-    >
-      --
-    </div>
-
-  </div>
-
+  <div class="box master"><div class="box-label">S1 · Master 90°</div><div class="box-value" id="s1">--</div></div>
+  <div class="box master"><div class="box-label">S2 · Master 45°</div><div class="box-value" id="s2">--</div></div>
+  <div class="box master"><div class="box-label">S3 · Master 70°</div><div class="box-value" id="s3">--</div></div>
+  <div class="box slave"><div class="box-label">S4 · Slave 90°</div><div class="box-value" id="s4">--</div></div>
+  <div class="box slave"><div class="box-label">S5 · Slave 45°</div><div class="box-value" id="s5">--</div></div>
+  <div class="box slave"><div class="box-label">S6 · Slave 70°</div><div class="box-value" id="s6">--</div></div>
+  <div class="box"><div class="box-label">X Position</div><div class="box-value" id="x">--</div></div>
+  <div class="box"><div class="box-label">Y Position</div><div class="box-value" id="y">--</div></div>
+  <div class="box"><div class="box-label">Support</div><div class="box-value" id="sup">--</div></div>
 </div>
-
-<div class="position-map">
-
-  <canvas
-    id="positionMap"
-    width="600"
-    height="360"
-  ></canvas>
-
+<div class="position-map"><canvas id="positionMap" width="500" height="600"></canvas></div>
+<div class="legend">
+  <span style="background:#4aa3ff"></span>Master beams (S1–S3)
+  &nbsp;&nbsp;
+  <span style="background:#5ed39a"></span>Slave beams (S4–S6)
+  &nbsp;&nbsp;
+  <span style="background:#ffcc33"></span>Player position
 </div>
-
-<div
-  class="status"
-  id="status"
->
-  Loading...
-</div>
+<div class="status" id="status">Loading...</div>
+<div class="status" id="deadStatus"></div>
 
 <script>
+const ANGLES = [90, 45, 70, 90, 45, 70];
+const BEAM_HALF_DEG = 15;
+const AREA_W = 1.5;
+const AREA_H = 1.8;
+const BOX_COLORS = ["#4aa3ff", "#5ed39a"];
 
-function fmt(v) {
+// Play area boundaries (cm)
+const DEAD_ZONE_CM = 55;
+const ROW1_END_CM  = 100;
+const ROW2_END_CM  = 140;
+const COL_LEFT_CM  = 35;
+const COL_RIGHT_CM = 115;
 
-  return (
-    v === null ||
-    v < 0
-  )
-    ? "--"
-    : v.toFixed(1) + " cm";
-}
+function fmt(v) { return (v == null || v < 0) ? "--" : v.toFixed(1) + " cm"; }
+function fmtC(v) { return (v == null || v < 0) ? "--" : v.toFixed(3); }
 
-function fmtCoordinate(v) {
+function drawPosition(x, y, sensors) {
+  const c = document.getElementById("positionMap");
+  const ctx = c.getContext("2d");
+  const W = c.width, H = c.height;
+  const toPx = (xm, dm) => [xm / AREA_W * W, H * (1 - dm / AREA_H)];
 
-  return (
-    v === null ||
-    v < 0
-  )
-    ? "--"
-    : v.toFixed(3);
-}
+  ctx.clearRect(0, 0, W, H);
 
-function drawPosition(x, y) {
-
-  const canvas =
-    document.getElementById(
-      "positionMap"
-    );
-
-  const ctx =
-    canvas.getContext("2d");
-
-  ctx.clearRect(
-    0,
-    0,
-    canvas.width,
-    canvas.height
-  );
-
-  const deadZoneDepth = 0.10;
-
-  const totalDepth = 1.8;
-
-  const row1End = 0.6;
-
-  const row2End = 1.0;
-
-  const depthToY =
-    depth =>
-      canvas.height *
-      (1 - depth / totalDepth);
-
-  const playAreaBottom =
-    depthToY(
-      deadZoneDepth
-    );
-
-  const columnLines = [
-    0.35 / 1.5,
-    1.15 / 1.5
-  ];
-
+  // Dead zone
+  const deadY = H * (1 - (DEAD_ZONE_CM / 100) / AREA_H);
   ctx.fillStyle = "#38272c";
+  ctx.fillRect(0, deadY, W, H - deadY);
 
-  ctx.fillRect(
-    0,
-    playAreaBottom,
-    canvas.width,
-    canvas.height -
-      playAreaBottom
-  );
+  // Middle dead column
+  const colLeftPx  = (COL_LEFT_CM / 100) / AREA_W * W;
+  const colRightPx = (COL_RIGHT_CM / 100) / AREA_W * W;
+  ctx.fillStyle = "#1a1520";
+  ctx.fillRect(colLeftPx, 0, colRightPx - colLeftPx, deadY);
 
+  // Sensor beam fans
+  for (let i = 0; i < 6; i++) {
+    const slave = i >= 3;
+    const ox = slave ? AREA_W : 0;
+    const dir = slave ? -1 : 1;
+    const col = BOX_COLORS[slave ? 1 : 0];
+    const a  = ANGLES[i] * Math.PI / 180;
+    const a0 = (ANGLES[i] - BEAM_HALF_DEG) * Math.PI / 180;
+    const a1 = (ANGLES[i] + BEAM_HALF_DEG) * Math.PI / 180;
+    const L = 2.6;
+    const o  = toPx(ox, 0);
+    const p0 = toPx(ox + dir * Math.cos(a0) * L, Math.sin(a0) * L);
+    const p1 = toPx(ox + dir * Math.cos(a1) * L, Math.sin(a1) * L);
+    ctx.fillStyle = col + "1a";
+    ctx.beginPath();
+    ctx.moveTo(o[0], o[1]);
+    ctx.lineTo(p0[0], p0[1]);
+    ctx.lineTo(p1[0], p1[1]);
+    ctx.closePath();
+    ctx.fill();
+
+    // Range dot on beam axis
+    const r = sensors[i];
+    if (r != null && r > 0) {
+      const rm = r / 100;
+      const pt = toPx(ox + dir * Math.cos(a) * rm, Math.sin(a) * rm);
+      ctx.fillStyle = col;
+      ctx.beginPath();
+      ctx.arc(pt[0], pt[1], 4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  // Grid lines
   ctx.strokeStyle = "#425466";
-
   ctx.lineWidth = 2;
 
-  for (
-    const boundary
-    of columnLines
-  ) {
+  // Column dividers
+  [COL_LEFT_CM, COL_RIGHT_CM].forEach(cm => {
+    const px = (cm / 100) / AREA_W * W;
+    ctx.beginPath(); ctx.moveTo(px, 0); ctx.lineTo(px, deadY); ctx.stroke();
+  });
 
-    ctx.beginPath();
+  // Row dividers
+  [ROW1_END_CM, ROW2_END_CM].forEach(cm => {
+    const py = H * (1 - (cm / 100) / AREA_H);
+    ctx.beginPath(); ctx.moveTo(0, py); ctx.lineTo(W, py); ctx.stroke();
+  });
 
-    ctx.moveTo(
-      canvas.width *
-        boundary,
-      0
-    );
+  // Play area border
+  ctx.strokeRect(0, 0, W, deadY);
 
-    ctx.lineTo(
-      canvas.width *
-        boundary,
-      playAreaBottom
-    );
-
-    ctx.stroke();
-  }
-
-  for (
-    const depth
-    of [row1End, row2End]
-  ) {
-
-    const rowY =
-      depthToY(
-        depth
-      );
-
-    ctx.beginPath();
-
-    ctx.moveTo(
-      0,
-      rowY
-    );
-
-    ctx.lineTo(
-      canvas.width,
-      rowY
-    );
-
-    ctx.stroke();
-  }
-
-  ctx.strokeRect(
-    0,
-    0,
-    canvas.width,
-    playAreaBottom
-  );
-
+  // Dead zone line
   ctx.strokeStyle = "#a85b62";
+  ctx.beginPath(); ctx.moveTo(0, deadY); ctx.lineTo(W, deadY); ctx.stroke();
 
-  ctx.beginPath();
-
-  ctx.moveTo(
-    0,
-    playAreaBottom
-  );
-
-  ctx.lineTo(
-    canvas.width,
-    playAreaBottom
-  );
-
-  ctx.stroke();
-
+  // Labels
   ctx.fillStyle = "#e3a0a4";
-
-  ctx.font =
-    "14px Consolas, monospace";
-
-  ctx.fillText(
-    "10 cm DEAD ZONE",
-    12,
-    playAreaBottom +
-      (canvas.height -
-        playAreaBottom) / 2 +
-      5
-  );
+  ctx.font = "13px Consolas, monospace";
+  ctx.fillText("55 cm DEAD ZONE", 12, deadY + (H - deadY) / 2 + 5);
 
   ctx.fillStyle = "#9eacb8";
+  ctx.font = "11px Consolas, monospace";
 
-  ctx.fillText(
-    "FAR ROW: " + row2End.toFixed(1) + "-180 cm",
-    12,
-    depthToY((row2End + totalDepth) / 2) + 5
-  );
+  const rowLabel = (text, fromCm, toCm) => {
+    const midCm = (fromCm + toCm) / 2;
+    const py = H * (1 - (midCm / 100) / AREA_H);
+    ctx.fillText(text, 12, py + 4);
+  };
+  rowLabel("NEAR: 55–100 cm",  55, 100);
+  rowLabel("MID:  100–140 cm", 100, 140);
+  rowLabel("FAR:  140–180 cm", 140, 180);
 
-  ctx.fillText(
-    "MIDDLE ROW: " + row1End.toFixed(1) + "-" + row2End.toFixed(1) + " cm",
-    12,
-    depthToY((row1End + row2End) / 2) + 5
-  );
-
-  ctx.fillText(
-    "NEAR ROW: 10-" + row1End.toFixed(1) + " cm",
-    12,
-    depthToY((deadZoneDepth + row1End) / 2) + 5
-  );
-
-  if (
-    x === null ||
-    y === null ||
-    x < 0 ||
-    y < 0
-  ) {
-
-    return;
-  }
-
+  // Player dot
+  if (x == null || y == null || x < 0 || y < 0) return;
   ctx.fillStyle = "#ffcc33";
-
+  ctx.shadowColor = "#ffcc33";
+  ctx.shadowBlur = 12;
   ctx.beginPath();
-
-  ctx.arc(
-    x * canvas.width,
-    y * canvas.height,
-    12,
-    0,
-    Math.PI * 2
-  );
-
+  ctx.arc(x * W, y * H, 12, 0, Math.PI * 2);
   ctx.fill();
+  ctx.shadowBlur = 0;
 }
 
 async function poll() {
-
   try {
+    const res = await fetch("/data", {cache: "no-store"});
+    const d = await res.json();
+    const sensors = [d.sensor1, d.sensor2, d.sensor3, d.sensor4, d.sensor5, d.sensor6];
+    for (let i = 0; i < 6; i++) {
+      document.getElementById("s" + (i + 1)).textContent = fmt(sensors[i]);
+    }
+    document.getElementById("x").textContent   = fmtC(d.x);
+    document.getElementById("y").textContent   = fmtC(d.y);
+    document.getElementById("sup").textContent = (d.x < 0) ? "--" : d.support + " / 6";
 
-    const res =
-      await fetch(
-        "/data",
-        {
-          cache: "no-store"
-        }
-      );
+    drawPosition(d.x, d.y, sensors);
 
-    const d =
-      await res.json();
+    const deadEl = document.getElementById("deadStatus");
+    if (d.deadZone) {
+      deadEl.textContent = "⚠️  DEAD ZONE — player too close to sensors";
+      deadEl.style.color = "#ff6666";
+    } else {
+      deadEl.textContent = "";
+    }
 
-    document.getElementById(
-      "s1"
-    ).textContent =
-      fmt(d.sensor1);
-
-    document.getElementById(
-      "s2"
-    ).textContent =
-      fmt(d.sensor2);
-
-    document.getElementById(
-      "s3"
-    ).textContent =
-      fmt(d.sensor3);
-
-    document.getElementById(
-      "s4"
-    ).textContent =
-      fmt(d.sensor4);
-
-    document.getElementById(
-      "x"
-    ).textContent =
-      fmtCoordinate(d.x);
-
-    document.getElementById(
-      "y"
-    ).textContent =
-      fmtCoordinate(d.y);
-
-    drawPosition(
-      d.x,
-      d.y
-    );
-
-    document.getElementById(
-      "status"
-    ).textContent =
-      "Updated " +
-      new Date()
-        .toLocaleTimeString();
-
+    document.getElementById("status").textContent =
+      "Updated " + new Date().toLocaleTimeString() +
+      (d.support > 0 ? "  ·  " + d.support + "/6 sensors supporting" : "");
   } catch (e) {
-
-    document.getElementById(
-      "status"
-    ).textContent =
-      "Connection lost";
+    document.getElementById("status").textContent = "Connection lost";
   }
 }
-
 poll();
-
-setInterval(
-  poll,
-  500
-);
-
+setInterval(poll, 500);
 </script>
-
 </body>
-
 </html>
 )HTML";
 
@@ -2412,22 +1005,27 @@ setInterval(
 // Web handlers
 // =====================================================================
 
-void handleRoot() {
+void handleRoot() { webServer.send(200, "text/html", DASHBOARD_HTML); }
+void handleData() { webServer.send(200, "application/json", cachedJson); }
 
-  webServer.send(
-    200,
-    "text/html",
-    DASHBOARD_HTML
-  );
-}
+// =====================================================================
+// Sensor self-test
+// =====================================================================
 
-void handleData() {
-
-  webServer.send(
-    200,
-    "application/json",
-    cachedJson
-  );
+void runSensorSelfTest() {
+  Serial.println("\n=== SENSOR SELF-TEST (Wi-Fi already up) ===");
+  Serial.println("Hold hand ~20 cm in front of each sensor in turn.");
+  for (int round = 0; round < 8; round++) {
+    for (int i = 0; i < SENSORS_PER_BOX; i++) {
+      float cm = readSensorDistance(SENSOR_TRIG_PINS[i], SENSOR_ECHO_PINS[i]);
+      Serial.printf("  S%d pins %d/%d  -> ", i + 1, SENSOR_TRIG_PINS[i], SENSOR_ECHO_PINS[i]);
+      if (cm < 0) Serial.println("NO ECHO");
+      else Serial.printf("%.1f cm\n", cm);
+      delay(80);
+    }
+    Serial.println();
+  }
+  Serial.println("=== SELF-TEST DONE ===\n");
 }
 
 // =====================================================================
@@ -2435,258 +1033,114 @@ void handleData() {
 // =====================================================================
 
 void setup() {
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  noTone(BUZZER_PIN);
 
-  pinMode(
-    LED_PIN,
-    OUTPUT
-  );
+  for (int i = 0; i < SENSORS_PER_BOX; i++) {
+    pinMode(SENSOR_TRIG_PINS[i], OUTPUT);
+    pinMode(SENSOR_ECHO_PINS[i], INPUT);
+    digitalWrite(SENSOR_TRIG_PINS[i], LOW);
+  }
 
-  pinMode(
-    BUZZER_PIN,
-    OUTPUT
-  );
-
-  noTone(
-    BUZZER_PIN
-  );
-
-  pinMode(
-    SENSOR_1_TRIG_PIN,
-    OUTPUT
-  );
-
-  pinMode(
-    SENSOR_1_ECHO_PIN,
-    INPUT
-  );
-
-  pinMode(
-    SENSOR_2_TRIG_PIN,
-    OUTPUT
-  );
-
-  pinMode(
-    SENSOR_2_ECHO_PIN,
-    INPUT
-  );
-
-  digitalWrite(
-    SENSOR_1_TRIG_PIN,
-    LOW
-  );
-
-  digitalWrite(
-    SENSOR_2_TRIG_PIN,
-    LOW
-  );
-
-  Serial.begin(
-    115200
-  );
-
+  Serial.begin(115200);
   delay(1000);
 
-  // ---------------------------------------------------------------
-  // Wi-Fi AP + ESP-NOW
-  // ---------------------------------------------------------------
+  // Build geometry tables (precompute expected ranges and angles).
+  buildGeometryTables();
 
-  WiFi.mode(
-    WIFI_AP_STA
-  );
+  // -----------------------------------------------------------------
+  // Bench mode: sensors only, no radio. Use this first to verify
+  // that all 3 master sensors are reading correctly.
+  // -----------------------------------------------------------------
 
-  WiFi.setSleep(
-    false
-  );
+#if BENCH_NO_WIFI
+  Serial.println("=== BENCH MODE — Wi-Fi OFF, master sensors only ===");
+  while (true) {
+    for (int i = 0; i < SENSORS_PER_BOX; i++) {
+      float cm = readSensorDistance(SENSOR_TRIG_PINS[i], SENSOR_ECHO_PINS[i]);
+      Serial.printf("S%d(%d/%d)=", i + 1, SENSOR_TRIG_PINS[i], SENSOR_ECHO_PINS[i]);
+      if (cm < 0) Serial.print("  ---   ");
+      else Serial.printf("%6.1fcm ", cm);
+      delay(SENSOR_SETTLE_DELAY_MS);
+    }
+    Serial.println();
+    delay(200);
+  }
+#endif
 
-  WiFi.softAP(
-    AP_SSID,
-    AP_PASSWORD,
-    FIXED_CHANNEL
-  );
+  // -----------------------------------------------------------------
+  // Wi-Fi AP + STA
+  // -----------------------------------------------------------------
 
-  Serial.println();
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.setSleep(false);
+  WiFi.softAP(AP_SSID, AP_PASSWORD, FIXED_CHANNEL);
 
-  Serial.println(
-    "ESP32 dual sensor - MASTER"
-  );
+  Serial.println("\n========================================");
+  Serial.println("ESP32 6-sensor Whack-a-Mole — MASTER");
+  Serial.println("========================================");
+  Serial.printf("Grid %dx%d, step %.0f cm, %d cells\n",
+                GRID_COLS, GRID_ROWS, GRID_STEP_M * 100, GRID_CELLS);
+  Serial.println("Pins: S1 32/35, S2 12/14, S3 22/23");
+  Serial.printf("Angles: S1=%.0f° S2=%.0f° S3=%.0f°  S4=%.0f° S5=%.0f° S6=%.0f°\n",
+                SENSOR_ANGLE_DEG[0], SENSOR_ANGLE_DEG[1], SENSOR_ANGLE_DEG[2],
+                SENSOR_ANGLE_DEG[3], SENSOR_ANGLE_DEG[4], SENSOR_ANGLE_DEG[5]);
+  Serial.printf("Dead zone: %.0f cm (release %.0f cm)\n",
+                DEAD_ZONE_DEPTH_CM, DEAD_ZONE_RELEASE_CM);
+  Serial.print("Master MAC: "); Serial.println(WiFi.macAddress());
+  Serial.print("SoftAP MAC: "); Serial.println(WiFi.softAPmacAddress());
+  Serial.printf("AP: %s / %s  ch %d\n", AP_SSID, AP_PASSWORD, FIXED_CHANNEL);
+  Serial.print("Dashboard: http://"); Serial.print(WiFi.softAPIP()); Serial.println("/");
 
-  Serial.println(
-    "Position algorithm: four-sensor lateral-aware trilateration"
-  );
-
-  Serial.println(
-    "Sensor layout: 70 deg (S1, S3) and 45 deg (S2, S4) from the wall"
-  );
-
-  Serial.println(
-    "Sensor 1: TRIG=32, ECHO=35"
-  );
-
-  Serial.println(
-    "Sensor 2: TRIG=12, ECHO=14"
-  );
-
-  Serial.print(
-    "Master MAC Address: "
-  );
-
-  Serial.println(
-    WiFi.macAddress()
-  );
-
-  Serial.print(
-    "Master SoftAP MAC: "
-  );
-
-  Serial.println(
-    WiFi.softAPmacAddress()
-  );
-
-  Serial.print(
-    "Wi-Fi network name: "
-  );
-
-  Serial.println(
-    AP_SSID
-  );
-
-  Serial.print(
-    "Wi-Fi password: "
-  );
-
-  Serial.println(
-    AP_PASSWORD
-  );
-
-  Serial.print(
-    "Fixed channel: "
-  );
-
-  Serial.println(
-    FIXED_CHANNEL
-  );
-
-  Serial.print(
-    "Dashboard: http://"
-  );
-
-  Serial.print(
-    WiFi.softAPIP()
-  );
-
-  Serial.println(
-    "/"
-  );
-
-  Serial.println(
-    "Connect your laptop's Wi-Fi to the network above."
-  );
-
-  // ---------------------------------------------------------------
+  // -----------------------------------------------------------------
   // UDP
-  // ---------------------------------------------------------------
+  // -----------------------------------------------------------------
 
-  udp.begin(
-    UDP_PORT
-  );
+  udp.begin(UDP_PORT);
 
-  // ---------------------------------------------------------------
+  // -----------------------------------------------------------------
+  // Self-test
+  // -----------------------------------------------------------------
+
+#if SELF_TEST_AT_BOOT
+  runSensorSelfTest();
+#endif
+
+  // -----------------------------------------------------------------
   // ESP-NOW
-  // ---------------------------------------------------------------
+  // -----------------------------------------------------------------
 
-  if (
-    esp_now_init() != ESP_OK
-  ) {
-
-    Serial.println(
-      "ESP-NOW init failed"
-    );
-
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init FAILED");
     return;
   }
+  esp_now_register_recv_cb(onDataReceived);
 
-  esp_now_register_recv_cb(
-    onDataReceived
-  );
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, ESPNOW_BROADCAST_MAC, 6);
+  peer.channel = FIXED_CHANNEL;
+  peer.encrypt = false;
+  peer.ifidx   = WIFI_IF_AP;
+  if (esp_now_add_peer(&peer) != ESP_OK)
+    Serial.println("Failed to add broadcast peer");
+  else
+    Serial.println("ESP-NOW broadcast peer OK");
 
-  esp_now_peer_info_t broadcastPeer = {};
+  uint8_t ch;
+  wifi_second_chan_t sec;
+  esp_wifi_get_channel(&ch, &sec);
+  Serial.printf("Radio actually on channel %d\n", ch);
 
-  memcpy(
-    broadcastPeer.peer_addr,
-    ESPNOW_BROADCAST_MAC,
-    6
-  );
-
-  broadcastPeer.channel =
-    FIXED_CHANNEL;
-
-  broadcastPeer.encrypt =
-    false;
-
-  broadcastPeer.ifidx =
-    WIFI_IF_AP;
-
-  if (
-    esp_now_add_peer(
-      &broadcastPeer
-    ) != ESP_OK
-  ) {
-
-    Serial.println(
-      "Failed to add ESP-NOW broadcast peer"
-    );
-
-  } else {
-
-    Serial.println(
-      "ESP-NOW broadcast peer registered"
-    );
-  }
-
-  uint8_t primaryChannel;
-
-  wifi_second_chan_t secondChannel;
-
-  esp_wifi_get_channel(
-    &primaryChannel,
-    &secondChannel
-  );
-
-  Serial.print(
-    "Master radio actually on channel: "
-  );
-
-  Serial.println(
-    primaryChannel
-  );
-
-  // ---------------------------------------------------------------
+  // -----------------------------------------------------------------
   // Web dashboard
-  // ---------------------------------------------------------------
+  // -----------------------------------------------------------------
 
-  webServer.on(
-    "/",
-    handleRoot
-  );
-
-  webServer.on(
-    "/data",
-    handleData
-  );
-
+  webServer.on("/", handleRoot);
+  webServer.on("/data", handleData);
   webServer.begin();
-
-  Serial.println(
-    "Web dashboard started"
-  );
-
-  Serial.println(
-    "ESP-NOW receiver ready"
-  );
-
-  Serial.println(
-    "----------------------------------------"
-  );
+  Serial.println("Web + ESP-NOW ready");
+  Serial.println("----------------------------------------");
 }
 
 // =====================================================================
@@ -2694,46 +1148,15 @@ void setup() {
 // =====================================================================
 
 void loop() {
-
   webServer.handleClient();
+  digitalWrite(LED_PIN, HIGH);
 
-  digitalWrite(
-    LED_PIN,
-    HIGH
-  );
+  buildSensorJson(cachedJson, sizeof(cachedJson));
 
-  buildSensorJson(
-    cachedJson,
-    sizeof(cachedJson)
-  );
+  udp.beginPacket(BROADCAST_IP, UDP_PORT);
+  udp.write((const uint8_t *)cachedJson, strlen(cachedJson));
+  if (udp.endPacket() == 0) Serial.println("UDP send failed");
 
-  udp.beginPacket(
-    BROADCAST_IP,
-    UDP_PORT
-  );
-
-  udp.write(
-    reinterpret_cast<
-      const uint8_t *
-    >(
-      cachedJson
-    ),
-    strlen(cachedJson)
-  );
-
-  if (
-    udp.endPacket() == 0
-  ) {
-
-    Serial.println(
-      "UDP broadcast send failed"
-    );
-  }
-
-  digitalWrite(
-    LED_PIN,
-    LOW
-  );
-
-  delay(20);
+  digitalWrite(LED_PIN, LOW);
+  waitMs(SENSOR_SETTLE_DELAY_MS);
 }
